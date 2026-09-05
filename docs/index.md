@@ -45,6 +45,11 @@ provider "paimon" {
 - `uri` (required): REST Catalog base URI. A base path is supported.
 - `warehouse` (optional): sent as the `warehouse` query parameter to
   `/v1/config`.
+- `request_timeout_seconds` (optional): timeout per HTTP request, including
+  credential requests. Defaults to 30; allowed range 1–3600.
+- `recovery_timeout_seconds` (optional): bounded read-back reconciliation after
+  a mutation. Defaults to 5; allowed range 1–3600. Increase it to cover the
+  catalog's expected visibility delay. This does not enable mutation retries.
 - `token_provider` (optional): `bear` for Bearer authentication or `dlf` for
   Alibaba Cloud DLF AK/STS signing. It is inferred when omitted.
 - `token` (optional, sensitive): token used by the `bear` provider.
@@ -65,8 +70,16 @@ provider "paimon" {
 - `dlf_token_path` (optional): path to the rotating AK/STS JSON file. Setting
   it implies the `local_file` loader.
 - `dlf_ecs_metadata_url` (optional): compatible ECS metadata endpoint override.
+  The endpoint must support the IMDS session-token API at `/latest/api/token`
+  on the same origin; the provider does not fall back to tokenless requests.
 - `dlf_ecs_role_name` (optional): RAM role name. The `ecs` loader discovers it
   when omitted.
+
+Bearer and DLF configuration are mutually exclusive. An explicit
+`token_provider = "bear"` rejects any nonempty `dlf_*` setting; a bearer `token`
+cannot accompany DLF settings, even when `token_provider` is inferred. Unknown
+values defer the check until configuration resolves. No credential settings
+are silently ignored.
 
 Exactly one DLF credential source may be configured: static AK/STS, a local
 token file, or an ECS RAM role. DLF Catalog requests also require `warehouse`.
@@ -78,6 +91,13 @@ The provider first calls `/v1/config`, merges server defaults, client values,
 and server overrides in that order, and then uses the resulting `prefix` for
 catalog operations. Redirects are rejected so authentication headers and DLF
 signatures are never reused for a different URL.
+
+The ECS loader obtains and caches an IMDS session token, refreshes it before
+expiry, and reacquires it once on an unauthorized metadata response. This
+supports instances with `HttpTokens=required`. Catalog error diagnostics expose
+HTTP/error codes and, when present, a UUID request ID suitable for support
+correlation; arbitrary response text and echoed authentication values are
+suppressed.
 
 ## Resources and data sources
 
@@ -93,3 +113,9 @@ The permission and policy resources use Paimon's experimental REST management
 contract. Principal lifecycle, type resolution, role membership, persistence,
 and authorization enforcement are server responsibilities. See the
 [permissions example](../examples/permissions/main.tf).
+
+See the [production validation guide](production-readiness.md) for integration
+coverage, compatibility evidence, and rollout checks.
+
+See the [API contract](api-contract.md) for the core resource model and
+experimental management boundary.

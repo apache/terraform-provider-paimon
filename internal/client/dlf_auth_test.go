@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -271,6 +272,9 @@ func TestECSDLFTokenLoaderDiscoversAndCachesRole(t *testing.T) {
 	var credentialRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/latest/api/token":
+			assert.Equal(t, http.MethodPut, r.Method)
+			_, _ = w.Write([]byte("metadata-token"))
 		case "/metadata/":
 			roleRequests.Add(1)
 			_, _ = w.Write([]byte("role-a\n"))
@@ -494,4 +498,68 @@ func TestUniqueDLFNonceConcurrent(t *testing.T) {
 		unique[value] = struct{}{}
 	}
 	assert.Len(t, unique, count)
+}
+
+func TestECSMetadataTokenRefreshAndRequiredMode(t *testing.T) {
+	now := time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC)
+	var tokenRequests, roleRequests atomic.Int32
+	var rejectToken atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/latest/api/token" {
+			require.Equal(t, http.MethodPut, r.Method)
+			require.Equal(t, "21600", r.Header.Get("X-aliyun-ecs-metadata-token-ttl-seconds"))
+			count := tokenRequests.Add(1)
+			_, _ = fmt.Fprintf(w, "token-%d", count)
+
+			return
+		}
+		expected := fmt.Sprintf("token-%d", tokenRequests.Load())
+		if r.Header.Get("X-aliyun-ecs-metadata-token") != expected || rejectToken.Swap(false) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("metadata-secret-must-not-escape"))
+
+			return
+		}
+		if r.URL.Path == "/metadata/" {
+			roleRequests.Add(1)
+			_, _ = w.Write([]byte("role-a"))
+
+			return
+		}
+		writeJSON(t, w, dlfCredentials{AccessKeyID: "id", AccessKeySecret: "secret", SecurityToken: "sts"})
+	}))
+	defer server.Close()
+	loader := &ecsDLFTokenLoader{metadataURL: server.URL + "/metadata/", httpClient: noRedirectHTTPClient(server.Client()), now: func() time.Time { return now }}
+	for range 2 {
+		creds, err := loader.Load(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, "sts", creds.SecurityToken)
+	}
+	require.Equal(t, int32(1), tokenRequests.Load())
+	now = now.Add(ecsMetadataTokenTTL)
+	_, err := loader.Load(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int32(2), tokenRequests.Load())
+	rejectToken.Store(true)
+	_, err = loader.Load(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int32(3), tokenRequests.Load())
+	require.Equal(t, int32(1), roleRequests.Load())
+}
+
+func TestECSMetadataTokenFailureDoesNotDowngrade(t *testing.T) {
+	var ordinaryRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			ordinaryRequests.Add(1)
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("metadata-secret-must-not-escape"))
+	}))
+	defer server.Close()
+	loader := &ecsDLFTokenLoader{metadataURL: server.URL + "/metadata/", httpClient: server.Client()}
+	_, err := loader.Load(context.Background())
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "metadata-secret-must-not-escape")
+	require.Zero(t, ordinaryRequests.Load())
 }

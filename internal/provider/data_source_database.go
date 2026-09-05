@@ -34,7 +34,7 @@ type databaseDataSource struct {
 
 type databaseDataSourceModel struct {
 	ID        types.String `tfsdk:"id"`
-	CatalogID types.String `tfsdk:"catalog_id"`
+	ServerID  types.String `tfsdk:"server_id"`
 	Name      types.String `tfsdk:"name"`
 	Options   types.Map    `tfsdk:"options"`
 	Location  types.String `tfsdk:"location"`
@@ -57,9 +57,9 @@ func (d *databaseDataSource) Schema(_ context.Context, _ datasource.SchemaReques
 	resp.Schema = schema.Schema{
 		Description: "Reads an existing database from a Paimon REST Catalog.",
 		Attributes: map[string]schema.Attribute{
-			"id":         schema.StringAttribute{Description: "Terraform identifier, equal to the database name.", Computed: true},
-			"catalog_id": schema.StringAttribute{Description: "Server-assigned database identifier.", Computed: true},
-			"name":       schema.StringAttribute{Description: "Database name.", Required: true},
+			"id":        schema.StringAttribute{Description: "Terraform identifier, equal to the database name.", Computed: true},
+			"server_id": schema.StringAttribute{Description: "Server-assigned database identifier.", Computed: true},
+			"name":      schema.StringAttribute{Description: "Database name.", Required: true},
 			"options": schema.MapAttribute{
 				Description: "All database options returned by the REST Catalog.",
 				Computed:    true,
@@ -92,7 +92,7 @@ func (d *databaseDataSource) Read(ctx context.Context, req datasource.ReadReques
 		return
 	}
 	data.ID = types.StringValue(database.Name)
-	data.CatalogID = types.StringValue(database.ID)
+	data.ServerID = types.StringValue(database.ID)
 	data.Name = types.StringValue(database.Name)
 	data.Options = stringMapValue(ctx, database.Options, &resp.Diagnostics)
 	data.Location = types.StringValue(database.Location)

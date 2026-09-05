@@ -20,11 +20,13 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -329,7 +331,7 @@ func TestSchemaMarshalAssignsUniqueNestedFieldIDs(t *testing.T) {
 			{
 				ID:   7,
 				Name: "payload",
-				Type: DataType("ROW<`item name` ARRAY<MAP<STRING NOT NULL, ROW<value VECTOR<DOUBLE, 3>>>> COMMENT 'item''s label' DEFAULT CAST(NULL AS STRING)>"),
+				Type: DataType("ROW<`item name` ARRAY<MAP<STRING NOT NULL, ROW<value VECTOR<DOUBLE, 3>>>> COMMENT 'item''s label'>"),
 			},
 		},
 	}
@@ -345,8 +347,7 @@ func TestSchemaMarshalAssignsUniqueNestedFieldIDs(t *testing.T) {
 					"id":8,
 					"name":"item name",
 					"type":{"type":"ARRAY","element":{"type":"MAP","key":"STRING NOT NULL","value":{"type":"ROW","fields":[{"id":9,"name":"value","type":{"type":"VECTOR","element":"DOUBLE","length":3}}]}}},
-					"description":"item's label",
-					"defaultValue":"CAST(NULL AS STRING)"
+					"description":"item's label"
 				}]
 			}}
 		],
@@ -428,6 +429,9 @@ func TestDataTypeMarshalSupportsEmptyRow(t *testing.T) {
 	assert.JSONEq(t, `{"type":"ROW NOT NULL","fields":[]}`, string(encoded))
 }
 
+// Lexical preservation only: these opaque expressions are intentionally not
+// examples of Java default conversion. The Catalog casts constant strings and
+// rejects expressions that cannot be cast to the field's type.
 func TestDataTypeMarshalKeepsComparisonsInNestedDefaults(t *testing.T) {
 	for _, test := range []struct {
 		name           string
@@ -616,4 +620,94 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
 	require.NoError(t, json.NewEncoder(w).Encode(value))
+}
+
+func TestMutationSuccessDoesNotDependOnUnusedResponseBody(t *testing.T) {
+	var created atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/config" {
+			writeJSON(t, w, ConfigResponse{})
+
+			return
+		}
+		if r.Method == http.MethodPost {
+			created.Store(true)
+			w.Header().Set("Content-Length", "10")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{}"))
+
+			return
+		}
+		writeJSON(t, w, Database{Name: "analytics"})
+	}))
+	defer server.Close()
+	api, err := New(Config{URI: server.URL})
+	require.NoError(t, err)
+	require.NoError(t, api.CreateDatabase(context.Background(), "analytics", nil))
+	require.True(t, created.Load())
+	database, err := api.GetDatabase(context.Background(), "analytics")
+	require.NoError(t, err)
+	require.Equal(t, "analytics", database.Name)
+}
+
+func TestRequestTimeoutPreservesUncertainMutationOutcome(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/config" {
+			writeJSON(t, w, ConfigResponse{})
+
+			return
+		}
+		calls.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	input := &http.Client{Timeout: time.Minute}
+	api, err := New(Config{URI: server.URL, HTTPClient: input, RequestTimeout: 50 * time.Millisecond, RecoveryTimeout: time.Second})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = api.CreateDatabase(ctx, "analytics", nil)
+	require.Error(t, err)
+	require.True(t, IsMutationOutcomeUncertain(err))
+	require.NoError(t, ctx.Err(), "the configured request timeout must expire first")
+	require.Equal(t, int32(1), calls.Load(), "an uncertain mutation must never be blindly retried")
+	require.Equal(t, time.Minute, input.Timeout, "do not alter the caller's shared HTTP client")
+	require.Equal(t, time.Second, api.RecoveryTimeout())
+}
+
+func TestAPIErrorsExposeOnlySafeRequestIDs(t *testing.T) {
+	const requestID = "89f29f74-3a2a-43b9-b698-f24e6e9c872c"
+	for _, test := range []struct {
+		name, header, token, want string
+	}{
+		{name: "correlation", header: requestID, want: requestID},
+		{name: "arbitrary response text", header: "secret-must-not-be-shown"},
+		{name: "echoed bearer", header: requestID, token: requestID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Acs-Request-Id", test.header)
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"code":403,"StatusCode":503,"message":"secret-response-body"}`))
+			}))
+			defer server.Close()
+			api, err := New(Config{URI: server.URL, Token: test.token})
+			require.NoError(t, err)
+			_, err = api.GetDatabase(context.Background(), "analytics")
+			require.Error(t, err)
+			var apiErr *APIError
+			require.ErrorAs(t, err, &apiErr)
+			require.Equal(t, http.StatusForbidden, apiErr.StatusCode, "the error body must not override the HTTP outcome")
+			require.False(t, IsMutationOutcomeUncertain(err))
+			require.Equal(t, test.want, apiErr.RequestID)
+			require.NotContains(t, err.Error(), "secret")
+			if test.want == "" {
+				require.NotContains(t, err.Error(), requestID)
+			} else {
+				require.Contains(t, err.Error(), requestID)
+			}
+		})
+	}
 }

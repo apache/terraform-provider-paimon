@@ -21,45 +21,53 @@ terraform {
   }
 }
 
-variable "paimon_token" {
+variable "catalog_uri" {
+  type = string
+}
+
+variable "warehouse" {
+  type = string
+}
+
+variable "catalog_token" {
   type      = string
   sensitive = true
-  default   = null
 }
 
 provider "paimon" {
-  uri   = "http://localhost:8080"
-  token = var.paimon_token
+  uri                      = var.catalog_uri
+  warehouse                = var.warehouse
+  token_provider           = "bear"
+  token                    = var.catalog_token
+  request_timeout_seconds  = 30
+  recovery_timeout_seconds = 60
 }
 
 resource "paimon_database" "analytics" {
   name = "analytics"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "paimon_table" "events" {
-  database = paimon_database.analytics.name
-  name     = "events"
-
+  database          = paimon_database.analytics.name
+  name              = "events"
+  allow_replacement = false
   fields = [
-    {
-      name     = "event_id"
-      type     = "BIGINT"
-      nullable = false
-    },
-    {
-      name = "event_time"
-      type = "TIMESTAMP(3)"
-    },
-    {
-      name = "payload"
-      type = "STRING"
-    }
+    { name = "id", type = "BIGINT", nullable = false },
+    { name = "payload", type = "STRING" }
   ]
 
   options = {
+    "primary-key" = "id"
 
-    "primary-key" = "event_id"
+    "bucket"       = "4"
+    "merge-engine" = "deduplicate"
+  }
 
-    bucket = "4"
+  lifecycle {
+    prevent_destroy = true
   }
 }

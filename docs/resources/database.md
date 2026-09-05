@@ -42,7 +42,7 @@ only values managed by Terraform; `server_options` exposes the complete map
 returned by the catalog. Updates remove only keys previously managed by this
 resource, preserving unrelated server values.
 
-The resource also exports `id`, `catalog_id`, `location`, `owner`,
+The resource also exports `id`, `server_id`, `location`, `owner`,
 `created_at`, `created_by`, `updated_at`, and `updated_by`.
 
 Import with the database name:

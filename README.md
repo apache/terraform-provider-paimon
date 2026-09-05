@@ -25,8 +25,9 @@ Catalog. It follows the provider shape established by
 but talks directly to Paimon's language-neutral REST Catalog API instead of
 embedding a JVM client.
 
-The provider is published from signed Apache release candidates. See the
-[release guide](docs/releasing.md) for the source-vote and Registry workflow.
+Releases use signed Apache release candidates. See the
+[release guide](docs/releasing.md) for the source-vote and Registry workflow,
+including verification of a published version before installation.
 
 ## Supported objects
 
@@ -91,10 +92,10 @@ resource "paimon_table" "events" {
     }
   ]
 
-  primary_keys   = ["event_id"]
   partition_keys = []
   options = {
-    "bucket" = "4"
+    "primary-key" = "event_id"
+    "bucket"      = "4"
   }
   comment = "Events managed by Terraform"
 }
@@ -118,6 +119,16 @@ Permission, row-filter, and column-mask resources use Paimon's experimental
 REST management API. Principal lifecycle and group or role membership remain
 server responsibilities.
 
+Table replacements are blocked unless `allow_replacement = true`.
+Protect retained production data with Terraform's `prevent_destroy` lifecycle
+rule as shown in the [production example](examples/production/main.tf).
+Row-filter and column-mask content updates require
+`allow_non_atomic_update = true` during a maintenance window because the REST
+API cannot update a policy atomically. Import existing policies explicitly.
+
+The [production validation guide](docs/production-readiness.md) distinguishes
+local protocol coverage from real REST/DLF and query-engine validation.
+
 ## Import
 
 ```bash
@@ -129,11 +140,16 @@ terraform import paimon_permission.analyst_read \
 
 ## Development
 
-Go 1.25 or newer is required.
+Use the Go version specified in `go.mod` or a newer compatible version.
 
 ```bash
 make check
+make test-acceptance
 ```
 
 See [`docs/index.md`](docs/index.md) for the full provider configuration and
 resource notes.
+
+See the [API contract](docs/api-contract.md) for the current resource model and
+experimental management boundary. Primary keys use `options["primary-key"]`;
+`primary_keys` is a computed output.

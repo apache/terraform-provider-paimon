@@ -28,6 +28,7 @@ import (
 	dschema "github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	rschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/mapplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -68,7 +69,7 @@ func tableResourceAttributes() map[string]rschema.Attribute {
 			Computed:      true,
 			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 		},
-		"catalog_id": rschema.StringAttribute{
+		"server_id": rschema.StringAttribute{
 			Description:   "Server-assigned table identifier.",
 			Computed:      true,
 			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
@@ -96,11 +97,9 @@ func tableResourceAttributes() map[string]rschema.Attribute {
 			PlanModifiers: []planmodifier.List{listplanmodifier.RequiresReplaceIfConfigured()},
 		},
 		"primary_keys": rschema.ListAttribute{
-			Description:   "Ordered primary key field names.",
-			Optional:      true,
-			Computed:      true,
-			ElementType:   types.StringType,
-			PlanModifiers: []planmodifier.List{listplanmodifier.RequiresReplaceIfConfigured()},
+			Description: "Primary key field names returned by Paimon. Configure primary keys with options[\"primary-key\"], using comma-separated field names.",
+			Computed:    true,
+			ElementType: types.StringType,
 		},
 		"options": rschema.MapAttribute{
 			Description:   "Table options managed by Terraform. Options not declared here are preserved. Paimon options that are immutable after creation cause replacement when changed.",
@@ -108,6 +107,12 @@ func tableResourceAttributes() map[string]rschema.Attribute {
 			ElementType:   types.StringType,
 			Validators:    []validator.Map{reservedTableOptionsValidator{}},
 			PlanModifiers: []planmodifier.Map{mapplanmodifier.RequiresReplaceIf(immutableTableOptionsRequiresReplace, "replaces the table when an immutable Paimon option changes", "replaces the table when an immutable Paimon option changes")},
+		},
+		"allow_replacement": rschema.BoolAttribute{
+			Description: "Permit automatic table replacement for schema changes and immutable options that cannot be evolved safely. Replacement can delete all table data. Defaults to false; lifecycle.prevent_destroy provides additional protection.",
+			Optional:    true,
+			Computed:    true,
+			Default:     booldefault.StaticBool(false),
 		},
 		"server_options": rschema.MapAttribute{
 			Description: "All table options returned by the REST Catalog.",
@@ -212,7 +217,7 @@ func newNonNullableFieldsRequireReplace(before, after []tableFieldModel) bool {
 func tableFieldResourceAttributes() map[string]rschema.Attribute {
 	return map[string]rschema.Attribute{
 		"id": rschema.Int64Attribute{
-			Description: "Stable Paimon field ID between 0 and " + strconv.Itoa(maxPaimonFieldID) + ". The next available ID is assigned when omitted.",
+			Description: "Stable Paimon field ID between 0 and " + strconv.Itoa(maxPaimonFieldID) + ". May be specified on creation or to identify an existing field; omit when adding a field to an existing table because Paimon assigns its ID.",
 			Optional:    true,
 			Computed:    true,
 		},
@@ -223,12 +228,12 @@ func tableFieldResourceAttributes() map[string]rschema.Attribute {
 			Validators:  []validator.String{stringvalidator.LengthAtLeast(1)},
 		},
 		"nullable": rschema.BoolAttribute{
-			Description: "Whether the field accepts null values. Defaults to true when omitted.",
+			Description: "Whether the field accepts null values. Omitted values retain existing field nullability; new non-key fields default to true. Primary keys follow primary-key.nullable (false by default).",
 			Optional:    true,
 			Computed:    true,
 		},
 		"description":   rschema.StringAttribute{Description: "Field description.", Optional: true},
-		"default_value": rschema.StringAttribute{Description: "Field default expression.", Optional: true},
+		"default_value": rschema.StringAttribute{Description: "Constant default value as a string, converted to the field type by Paimon; SQL expressions are not evaluated. Null removes the default; an empty string is a distinct value.", Optional: true},
 		"nested_field_ids": rschema.MapAttribute{
 			Description: "Stable nested ROW field IDs keyed by escaped field path. Populated by the REST Catalog.",
 			Computed:    true,
@@ -239,10 +244,10 @@ func tableFieldResourceAttributes() map[string]rschema.Attribute {
 
 func tableDataSourceAttributes() map[string]dschema.Attribute {
 	return map[string]dschema.Attribute{
-		"id":         dschema.StringAttribute{Description: "Stable URL-query identifier for the table identity.", Computed: true},
-		"catalog_id": dschema.StringAttribute{Description: "Server-assigned table identifier.", Computed: true},
-		"database":   dschema.StringAttribute{Description: "Database containing the table.", Required: true},
-		"name":       dschema.StringAttribute{Description: "Table name.", Required: true},
+		"id":        dschema.StringAttribute{Description: "Stable URL-query identifier for the table identity.", Computed: true},
+		"server_id": dschema.StringAttribute{Description: "Server-assigned table identifier.", Computed: true},
+		"database":  dschema.StringAttribute{Description: "Database containing the table.", Required: true},
+		"name":      dschema.StringAttribute{Description: "Table name.", Required: true},
 		"fields": dschema.ListNestedAttribute{
 			Description:  "Ordered table fields.",
 			Computed:     true,
@@ -270,7 +275,7 @@ func tableFieldDataSourceAttributes() map[string]dschema.Attribute {
 		"type":          dschema.StringAttribute{Description: "Canonical Paimon SQL data type.", Computed: true},
 		"nullable":      dschema.BoolAttribute{Description: "Whether the field accepts null values.", Computed: true},
 		"description":   dschema.StringAttribute{Description: "Field description.", Computed: true},
-		"default_value": dschema.StringAttribute{Description: "Field default expression.", Computed: true},
+		"default_value": dschema.StringAttribute{Description: "Constant default value as a string, converted to the field type by Paimon; SQL expressions are not evaluated. Null removes the default; an empty string is a distinct value.", Computed: true},
 		"nested_field_ids": dschema.MapAttribute{
 			Description: "Stable nested ROW field IDs keyed by escaped field path.",
 			Computed:    true,
@@ -286,14 +291,20 @@ func schemaFromResourceModel(ctx context.Context, model *tableResourceModel, dia
 	if diags.HasError() {
 		return client.Schema{}
 	}
-	if _, exists := options["primary-key"]; exists {
-		diags.AddError("Reserved table option", "Configure primary_keys instead of the primary-key table option.")
+	if configured, exists := options["primary-key"]; exists {
+		primaryKeys = parsePrimaryKeyOption(configured)
+		delete(options, "primary-key")
 	}
 	if _, exists := options["partition"]; exists {
 		diags.AddError("Reserved table option", "Configure partition_keys instead of the partition table option.")
 	}
 	primaryKeyNullable := false
-	if configured, exists := options["primary-key.nullable"]; exists {
+	configured, exists := options["primary-key.nullable"]
+	if !exists && !model.ServerOptions.IsNull() && !model.ServerOptions.IsUnknown() {
+		serverOptions := mapFromValue(ctx, model.ServerOptions, diags)
+		configured, exists = serverOptions["primary-key.nullable"]
+	}
+	if exists {
 		parsed, err := strconv.ParseBool(configured)
 		if err != nil {
 			diags.AddError("Invalid primary-key.nullable option", "Expected a boolean value, got: "+configured)
@@ -440,10 +451,11 @@ func resourceFieldsValueFromRemote(ctx context.Context, managed types.List, fiel
 		if managedModels[index].Name.ValueString() != models[index].Name.ValueString() {
 			continue
 		}
-		if client.EquivalentDataTypes(
-			client.DataType(managedModels[index].Type.ValueString()),
-			client.DataType(models[index].Type.ValueString()),
-		) {
+		managedType, managedNullable := splitFieldType(client.DataType(managedModels[index].Type.ValueString()))
+		if !managedNullable && models[index].Nullable.ValueBool() {
+			continue
+		}
+		if client.EquivalentDataTypes(managedType, client.DataType(models[index].Type.ValueString())) {
 			models[index].Type = managedModels[index].Type
 		}
 	}

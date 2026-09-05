@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: build check check-license fmt fmt-check fmt-terraform test test-acceptance test-race validate-examples vet
+.PHONY: build check check-license fmt fmt-check fmt-terraform test test-acceptance test-acceptance-tofu test-integration test-race validate-examples vet
 
 build:
 	go build ./...
@@ -35,6 +35,15 @@ test:
 
 test-acceptance:
 	TF_ACC=1 go test -v ./internal/provider -run '^TestAcc'
+
+test-acceptance-tofu:
+	@command -v tofu >/dev/null || (echo "OpenTofu must be installed on PATH" >&2; exit 1)
+	TF_ACC=1 TF_ACC_TERRAFORM_PATH="$$(command -v tofu)" TF_ACC_PROVIDER_HOST=registry.opentofu.org go test -v ./internal/provider -run '^TestAcc'
+
+test-integration:
+	@test -n "$$PAIMON_ACC_URI" || (echo "PAIMON_ACC_URI must name an isolated REST Catalog" >&2; exit 1)
+	@test "$$PAIMON_ACC_ALLOW_MUTATIONS" = "1" || (echo "PAIMON_ACC_ALLOW_MUTATIONS=1 is required for live catalog acceptance" >&2; exit 1)
+	TF_ACC=1 go test -v ./internal/provider -run '^TestAccRealCatalog$$' -count=1
 
 test-race:
 	go test -race ./...

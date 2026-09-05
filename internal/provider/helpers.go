@@ -31,8 +31,7 @@ import (
 )
 
 const (
-	mutationRecoveryTimeout = 5 * time.Second
-	mutationReadRetryDelay  = 50 * time.Millisecond
+	mutationReadRetryDelay = 50 * time.Millisecond
 )
 
 func clientFromProviderData(data any, target **client.Client, diags *diag.Diagnostics, kind string) {
@@ -124,10 +123,10 @@ func equivalentJSON(left, right string) bool {
 	return reflect.DeepEqual(leftValue, rightValue)
 }
 
-func mutationRecoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+func mutationRecoveryContext(ctx context.Context, api *client.Client) (context.Context, context.CancelFunc) {
 	// A canceled apply context can still follow a mutation that committed remotely.
 	// Keep request-scoped values, but give reconciliation and repair a fresh bound.
-	return context.WithTimeout(context.WithoutCancel(ctx), mutationRecoveryTimeout)
+	return context.WithTimeout(context.WithoutCancel(ctx), api.RecoveryTimeout())
 }
 
 func retryLookupUntil[T any](ctx context.Context, lookup func(context.Context) (T, bool, error), ready func(T) bool) (T, bool, bool, error) {
@@ -196,4 +195,21 @@ func diffOptions(before, after map[string]string) ([]string, map[string]string) 
 	}
 
 	return removals, updates
+}
+
+// optionsConverged checks both halves of an update. A missing key is not an
+// empty value, and a removed key must no longer be present in the catalog.
+func optionsConverged(remote, planned map[string]string, removals []string) bool {
+	for key, value := range planned {
+		if observed, exists := remote[key]; !exists || observed != value {
+			return false
+		}
+	}
+	for _, key := range removals {
+		if _, exists := remote[key]; exists {
+			return false
+		}
+	}
+
+	return true
 }

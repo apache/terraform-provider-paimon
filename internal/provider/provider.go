@@ -20,10 +20,13 @@ package provider
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/apache/terraform-provider-paimon/internal/client"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -31,28 +34,53 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-var _ provider.Provider = &paimonProvider{}
+var (
+	_ provider.Provider                   = &paimonProvider{}
+	_ provider.ProviderWithValidateConfig = &paimonProvider{}
+)
+
+func (p *paimonProvider) ValidateConfig(ctx context.Context, req provider.ValidateConfigRequest, resp *provider.ValidateConfigResponse) {
+	var config paimonProviderModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if !resp.Diagnostics.HasError() {
+		validateAuthenticationConfig(config, &resp.Diagnostics)
+	}
+}
+
+func validateAuthenticationConfig(config paimonProviderModel, diags *diag.Diagnostics) {
+	if config.TokenProvider.IsUnknown() {
+		return
+	}
+	if knownString(config.TokenProvider) == client.AuthProviderBearer && hasDLFConfiguration(config) {
+		diags.AddError("Conflicting authentication configuration", "token_provider = bear cannot be combined with dlf_* configuration. Configure one authentication method.")
+	}
+	if knownString(config.Token) != "" && (knownString(config.TokenProvider) == client.AuthProviderDLF || hasDLFConfiguration(config)) {
+		diags.AddError("Conflicting authentication configuration", "A bearer token cannot be combined with DLF authentication or dlf_* configuration.")
+	}
+}
 
 type paimonProvider struct {
 	version string
 }
 
 type paimonProviderModel struct {
-	URI                 types.String `tfsdk:"uri"`
-	Warehouse           types.String `tfsdk:"warehouse"`
-	TokenProvider       types.String `tfsdk:"token_provider"`
-	Token               types.String `tfsdk:"token"`
-	DLFRegion           types.String `tfsdk:"dlf_region"`
-	DLFSigningAlgorithm types.String `tfsdk:"dlf_signing_algorithm"`
-	DLFAccessKeyID      types.String `tfsdk:"dlf_access_key_id"`
-	DLFAccessKeySecret  types.String `tfsdk:"dlf_access_key_secret"`
-	DLFSecurityToken    types.String `tfsdk:"dlf_security_token"`
-	DLFTokenPath        types.String `tfsdk:"dlf_token_path"`
-	DLFTokenLoader      types.String `tfsdk:"dlf_token_loader"`
-	DLFECSMetadataURL   types.String `tfsdk:"dlf_ecs_metadata_url"`
-	DLFECSRoleName      types.String `tfsdk:"dlf_ecs_role_name"`
-	Prefix              types.String `tfsdk:"prefix"`
-	Headers             types.Map    `tfsdk:"headers"`
+	URI                    types.String `tfsdk:"uri"`
+	Warehouse              types.String `tfsdk:"warehouse"`
+	TokenProvider          types.String `tfsdk:"token_provider"`
+	Token                  types.String `tfsdk:"token"`
+	DLFRegion              types.String `tfsdk:"dlf_region"`
+	DLFSigningAlgorithm    types.String `tfsdk:"dlf_signing_algorithm"`
+	DLFAccessKeyID         types.String `tfsdk:"dlf_access_key_id"`
+	DLFAccessKeySecret     types.String `tfsdk:"dlf_access_key_secret"`
+	DLFSecurityToken       types.String `tfsdk:"dlf_security_token"`
+	DLFTokenPath           types.String `tfsdk:"dlf_token_path"`
+	DLFTokenLoader         types.String `tfsdk:"dlf_token_loader"`
+	DLFECSMetadataURL      types.String `tfsdk:"dlf_ecs_metadata_url"`
+	DLFECSRoleName         types.String `tfsdk:"dlf_ecs_role_name"`
+	Prefix                 types.String `tfsdk:"prefix"`
+	Headers                types.Map    `tfsdk:"headers"`
+	RequestTimeoutSeconds  types.Int64  `tfsdk:"request_timeout_seconds"`
+	RecoveryTimeoutSeconds types.Int64  `tfsdk:"recovery_timeout_seconds"`
 }
 
 func New(version string) func() provider.Provider {
@@ -70,6 +98,16 @@ func (p *paimonProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 	resp.Schema = schema.Schema{
 		Description: "Use Terraform to manage databases, tables, permissions, and data policies through an Apache Paimon REST Catalog.",
 		Attributes: map[string]schema.Attribute{
+			"request_timeout_seconds": schema.Int64Attribute{
+				Description: "Timeout for each REST or metadata HTTP request, in seconds. Defaults to 30. Valid values: 1 to 3600.",
+				Optional:    true,
+				Validators:  []validator.Int64{int64validator.Between(1, 3600)},
+			},
+			"recovery_timeout_seconds": schema.Int64Attribute{
+				Description: "Maximum reconciliation time after a mutation, in seconds. Defaults to 5. Set this to cover the catalog's visibility delay. Valid values: 1 to 3600.",
+				Optional:    true,
+				Validators:  []validator.Int64{int64validator.Between(1, 3600)},
+			},
 			"uri": schema.StringAttribute{
 				Description: "Base URI of the Paimon REST Catalog server.",
 				Required:    true,
@@ -146,6 +184,7 @@ func (p *paimonProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 func (p *paimonProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	var data paimonProviderModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
+	validateAuthenticationConfig(data, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -192,13 +231,15 @@ func (p *paimonProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	}
 
 	api, err := client.New(client.Config{
-		URI:          data.URI.ValueString(),
-		Warehouse:    knownString(data.Warehouse),
-		AuthProvider: authProvider,
-		Token:        knownString(data.Token),
-		DLF:          dlfConfig,
-		Prefix:       knownString(data.Prefix),
-		Headers:      headers,
+		RequestTimeout:  time.Duration(data.RequestTimeoutSeconds.ValueInt64()) * time.Second,
+		RecoveryTimeout: time.Duration(data.RecoveryTimeoutSeconds.ValueInt64()) * time.Second,
+		URI:             data.URI.ValueString(),
+		Warehouse:       knownString(data.Warehouse),
+		AuthProvider:    authProvider,
+		Token:           knownString(data.Token),
+		DLF:             dlfConfig,
+		Prefix:          knownString(data.Prefix),
+		Headers:         headers,
 	})
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid Paimon provider configuration", fmt.Sprintf("Unable to create the REST Catalog client: %s", err))

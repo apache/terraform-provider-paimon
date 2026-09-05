@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"maps"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 
@@ -45,24 +46,25 @@ type tableResource struct {
 }
 
 type tableResourceModel struct {
-	ID            types.String `tfsdk:"id"`
-	CatalogID     types.String `tfsdk:"catalog_id"`
-	Database      types.String `tfsdk:"database"`
-	Name          types.String `tfsdk:"name"`
-	Fields        types.List   `tfsdk:"fields"`
-	PartitionKeys types.List   `tfsdk:"partition_keys"`
-	PrimaryKeys   types.List   `tfsdk:"primary_keys"`
-	Options       types.Map    `tfsdk:"options"`
-	ServerOptions types.Map    `tfsdk:"server_options"`
-	Comment       types.String `tfsdk:"comment"`
-	SchemaID      types.Int64  `tfsdk:"schema_id"`
-	Path          types.String `tfsdk:"path"`
-	IsExternal    types.Bool   `tfsdk:"is_external"`
-	Owner         types.String `tfsdk:"owner"`
-	CreatedAt     types.Int64  `tfsdk:"created_at"`
-	CreatedBy     types.String `tfsdk:"created_by"`
-	UpdatedAt     types.Int64  `tfsdk:"updated_at"`
-	UpdatedBy     types.String `tfsdk:"updated_by"`
+	ID               types.String `tfsdk:"id"`
+	ServerID         types.String `tfsdk:"server_id"`
+	Database         types.String `tfsdk:"database"`
+	Name             types.String `tfsdk:"name"`
+	Fields           types.List   `tfsdk:"fields"`
+	PartitionKeys    types.List   `tfsdk:"partition_keys"`
+	PrimaryKeys      types.List   `tfsdk:"primary_keys"`
+	Options          types.Map    `tfsdk:"options"`
+	AllowReplacement types.Bool   `tfsdk:"allow_replacement"`
+	ServerOptions    types.Map    `tfsdk:"server_options"`
+	Comment          types.String `tfsdk:"comment"`
+	SchemaID         types.Int64  `tfsdk:"schema_id"`
+	Path             types.String `tfsdk:"path"`
+	IsExternal       types.Bool   `tfsdk:"is_external"`
+	Owner            types.String `tfsdk:"owner"`
+	CreatedAt        types.Int64  `tfsdk:"created_at"`
+	CreatedBy        types.String `tfsdk:"created_by"`
+	UpdatedAt        types.Int64  `tfsdk:"updated_at"`
+	UpdatedBy        types.String `tfsdk:"updated_by"`
 }
 
 func NewTableResource() resource.Resource {
@@ -85,44 +87,97 @@ func (r *tableResource) Configure(_ context.Context, req resource.ConfigureReque
 }
 
 func (r *tableResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+	if req.Plan.Raw.IsNull() {
 		return
 	}
 
 	var config, state, plan tableResourceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
-	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if !req.State.Raw.IsNull() {
+		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	}
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	var configuredFields, stateFields, plannedFields []tableFieldModel
-	resp.Diagnostics.Append(config.Fields.ElementsAs(ctx, &configuredFields, false)...)
-	resp.Diagnostics.Append(state.Fields.ElementsAs(ctx, &stateFields, false)...)
-	resp.Diagnostics.Append(plan.Fields.ElementsAs(ctx, &plannedFields, false)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	if len(configuredFields) != len(plannedFields) {
-		resp.Diagnostics.AddError("Unable to stabilize Paimon field identities", "The configured and planned field lists have different lengths. Please report this issue to the provider developers.")
+	stabilizeTableKeys(ctx, config, state, &plan, &resp.Diagnostics)
+	replacementPaths := make([]path.Path, 0)
+	if tableFieldsInspectable(config.Fields) && tableFieldsInspectable(plan.Fields) {
+		var configuredFields, stateFields, plannedFields []tableFieldModel
+		resp.Diagnostics.Append(config.Fields.ElementsAs(ctx, &configuredFields, false)...)
+		if !req.State.Raw.IsNull() {
+			resp.Diagnostics.Append(state.Fields.ElementsAs(ctx, &stateFields, false)...)
+		}
+		resp.Diagnostics.Append(plan.Fields.ElementsAs(ctx, &plannedFields, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if len(configuredFields) != len(plannedFields) {
+			resp.Diagnostics.AddError("Unable to stabilize Paimon field identities", "The configured and planned field lists have different lengths. Please report this issue to the provider developers.")
 
-		return
-	}
+			return
+		}
 
-	stabilizePlannedFieldIdentities(configuredFields, stateFields, plannedFields)
-	keyFields := append(stringListFromValue(ctx, state.PartitionKeys, &resp.Diagnostics), stringListFromValue(ctx, state.PrimaryKeys, &resp.Diagnostics)...)
-	keyFields = append(keyFields, stringListFromValue(ctx, plan.PartitionKeys, &resp.Diagnostics)...)
-	keyFields = append(keyFields, stringListFromValue(ctx, plan.PrimaryKeys, &resp.Diagnostics)...)
-	plan.Fields = fieldsValueFromModels(ctx, plannedFields, &resp.Diagnostics)
-	if resp.Diagnostics.HasError() {
-		return
+		stabilizePlannedFieldIdentities(configuredFields, stateFields, plannedFields)
+		if !req.State.Raw.IsNull() {
+			validateAddedFieldIDs(stateFields, configuredFields, &resp.Diagnostics)
+		}
+		stabilizeFieldNullability(ctx, configuredFields, stateFields, plannedFields, plan, state, &resp.Diagnostics)
+		keyFields := append(stringListFromValue(ctx, state.PartitionKeys, &resp.Diagnostics), stringListFromValue(ctx, state.PrimaryKeys, &resp.Diagnostics)...)
+		keyFields = append(keyFields, stringListFromValue(ctx, plan.PartitionKeys, &resp.Diagnostics)...)
+		keyFields = append(keyFields, stringListFromValue(ctx, plan.PrimaryKeys, &resp.Diagnostics)...)
+		plan.Fields = fieldsValueFromModels(ctx, plannedFields, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if !req.State.Raw.IsNull() && (compositeFieldTypesRequireReplace(stateFields, plannedFields) ||
+			keyFieldTypesRequireReplace(stateFields, plannedFields, keyFields) ||
+			newNonNullableFieldsRequireReplace(stateFields, plannedFields)) {
+			replacementPaths = append(replacementPaths, path.Root("fields"))
+		}
+
 	}
 	resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
-	if compositeFieldTypesRequireReplace(stateFields, plannedFields) ||
-		keyFieldTypesRequireReplace(stateFields, plannedFields, keyFields) ||
-		newNonNullableFieldsRequireReplace(stateFields, plannedFields) {
-		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("fields"))
+	if req.State.Raw.IsNull() || resp.Diagnostics.HasError() {
+		return
+	}
+	if !plan.PrimaryKeys.IsUnknown() && !state.PrimaryKeys.Equal(plan.PrimaryKeys) {
+		replacementPaths = append(replacementPaths, path.Root("options").AtMapKey("primary-key"))
+	}
+	if !plan.PartitionKeys.IsUnknown() && !state.PartitionKeys.Equal(plan.PartitionKeys) {
+		replacementPaths = append(replacementPaths, path.Root("partition_keys"))
+	}
+	if !plan.Name.IsUnknown() && !state.Name.Equal(plan.Name) {
+		replacementPaths = append(replacementPaths, path.Root("name"))
+	}
+	if !plan.Database.IsUnknown() && !state.Database.Equal(plan.Database) {
+		replacementPaths = append(replacementPaths, path.Root("database"))
+	}
+	if len(replacementPaths) > 0 {
+		if !plan.AllowReplacement.ValueBool() {
+			resp.Diagnostics.AddError("Destructive table change is disabled", "This table identity or schema change requires dropping and recreating the table and can delete its data. Use a data migration, or explicitly set allow_replacement = true to permit replacement.")
+
+			return
+		}
+		resp.RequiresReplace = append(resp.RequiresReplace, replacementPaths...)
+	}
+}
+
+func validateAddedFieldIDs(previous, configured []tableFieldModel, diags *diag.Diagnostics) {
+	known := make(map[int64]struct{}, len(previous))
+	for _, field := range previous {
+		if !field.ID.IsNull() && !field.ID.IsUnknown() {
+			known[field.ID.ValueInt64()] = struct{}{}
+		}
+	}
+	for index, field := range configured {
+		if field.ID.IsNull() || field.ID.IsUnknown() {
+			continue
+		}
+		if _, exists := known[field.ID.ValueInt64()]; !exists {
+			diags.AddAttributeError(path.Root("fields").AtListIndex(index).AtName("id"), "New field IDs are assigned by Paimon", "Omit id when adding a field to an existing table. Explicit IDs identify existing fields for updates and renames; the add-column API assigns new IDs on the server.")
+		}
 	}
 }
 
@@ -166,7 +221,7 @@ func (r *tableResource) Create(ctx context.Context, req resource.CreateRequest, 
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if err := r.client.CreateTable(ctx, plan.Database.ValueString(), plan.Name.ValueString(), tableSchema); err != nil {
+	if err := r.client.CreateTable(ctx, plan.Database.ValueString(), plan.Name.ValueString(), tableCreateSchema(ctx, plan, tableSchema, &resp.Diagnostics)); err != nil {
 		if !client.IsMutationOutcomeUncertain(err) {
 			resp.Diagnostics.AddError("Unable to create Paimon table", err.Error())
 
@@ -237,10 +292,12 @@ func (r *tableResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	}
 
 	beforeSchema := schemaFromResourceModel(ctx, &state, &resp.Diagnostics)
-	afterSchema := schemaFromResourceModel(ctx, &plan, &resp.Diagnostics)
+	effectivePlan := tablePlanWithServerDefaults(plan, state)
+	afterSchema := schemaFromResourceModel(ctx, &effectivePlan, &resp.Diagnostics)
 	var plannedFields []tableFieldModel
 	resp.Diagnostics.Append(plan.Fields.ElementsAs(ctx, &plannedFields, false)...)
 	if !resp.Diagnostics.HasError() {
+		validateAddedFieldIDs(fieldModelsFromRemote(beforeSchema.Fields), plannedFields, &resp.Diagnostics)
 		if err := assignTemporaryIDsToNewFields(beforeSchema.Fields, plannedFields, afterSchema.Fields); err != nil {
 			resp.Diagnostics.AddError("Unable to plan Paimon table field identities", err.Error())
 		}
@@ -251,7 +308,13 @@ func (r *tableResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	removals, updates := diffTableOptions(before, after)
+	if !slices.Equal(beforeSchema.PrimaryKeys, afterSchema.PrimaryKeys) || !slices.Equal(beforeSchema.PartitionKeys, afterSchema.PartitionKeys) {
+		resp.Diagnostics.AddError("Table key change requires replacement", "Changing table keys must be planned as a replacement; no in-place key mutation was sent.")
+
+		return
+	}
+	baseline := mapFromValue(ctx, effectiveManagedTableOptions(state.Options, plan.Options, tableOptionsWithPrimaryKeys(ctx, state.ServerOptions, state.PrimaryKeys, &resp.Diagnostics)), &resp.Diagnostics)
+	removals, updates := diffTableOptions(baseline, after)
 	sort.Strings(removals)
 	updateKeys := make([]string, 0, len(updates))
 	for key := range updates {
@@ -279,13 +342,19 @@ func (r *tableResource) Update(ctx context.Context, req resource.UpdateRequest, 
 	if !state.Comment.Equal(plan.Comment) {
 		changes = append(changes, client.SchemaChange{"action": "updateComment", "comment": optionalStringPointer(plan.Comment)})
 	}
+	stableCtx := context.WithoutCancel(ctx)
+	resp.Diagnostics.Append(resp.State.Set(stableCtx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ready := func(observed *client.Table) bool {
+		return tableMatchesPlannedSchema(observed, afterSchema, false, false) && optionsConverged(observed.Schema.Options, nil, removals)
+	}
 
 	if len(changes) > 0 {
 		if err := r.client.AlterTable(ctx, plan.Database.ValueString(), plan.Name.ValueString(), changes); err != nil {
 			if client.IsMutationOutcomeUncertain(err) {
-				table, recoveryErr := r.lookupAfterMutation(ctx, plan.Database.ValueString(), plan.Name.ValueString(), func(observed *client.Table) bool {
-					return tableMatchesPlannedSchema(observed, afterSchema, false, false)
-				})
+				table, recoveryErr := r.lookupAfterMutation(ctx, plan.Database.ValueString(), plan.Name.ValueString(), ready)
 				if recoveryErr == nil {
 					stableCtx := context.WithoutCancel(ctx)
 					setTableResourceModel(stableCtx, &plan, table, &resp.Diagnostics)
@@ -300,17 +369,9 @@ func (r *tableResource) Update(ctx context.Context, req resource.UpdateRequest, 
 			return
 		}
 	}
-	stableCtx := context.WithoutCancel(ctx)
-	plan.ID = types.StringValue(tableID(plan.Database.ValueString(), plan.Name.ValueString()))
-	resp.Diagnostics.Append(resp.State.Set(stableCtx, &plan)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	table, err := r.lookupAfterMutation(ctx, plan.Database.ValueString(), plan.Name.ValueString(), func(observed *client.Table) bool {
-		return tableMatchesPlannedSchema(observed, afterSchema, false, false)
-	})
+	table, err := r.lookupAfterMutation(ctx, plan.Database.ValueString(), plan.Name.ValueString(), ready)
 	if err != nil {
-		resp.Diagnostics.AddError("Unable to verify Paimon table after update", err.Error()+". Terraform retained the planned table state.")
+		resp.Diagnostics.AddError("Unable to verify Paimon table after update", err.Error()+". Terraform retained the previous state so unverified removals remain managed.")
 
 		return
 	}
@@ -342,7 +403,7 @@ func (r *tableResource) ImportState(ctx context.Context, req resource.ImportStat
 }
 
 func (r *tableResource) lookupAfterMutation(ctx context.Context, database, name string, ready func(*client.Table) bool) (*client.Table, error) {
-	recoveryCtx, cancel := mutationRecoveryContext(ctx)
+	recoveryCtx, cancel := mutationRecoveryContext(ctx, r.client)
 	defer cancel()
 	table, found, converged, err := retryLookupUntil(recoveryCtx, func(attemptCtx context.Context) (*client.Table, bool, error) {
 		observed, lookupErr := r.client.GetTable(attemptCtx, database, name)
@@ -386,7 +447,16 @@ func tableMatchesPlannedSchema(table *client.Table, expected client.Schema, comp
 		}
 	}
 	for key, value := range expected.Options {
-		if table.Schema.Options[key] != value {
+		observed, exists := table.Schema.Options[key]
+		if key == "type" {
+			if !exists {
+				observed = "table"
+			}
+			if strings.EqualFold(observed, value) {
+				continue
+			}
+		}
+		if !exists || observed != value {
 			return false
 		}
 	}
@@ -404,13 +474,16 @@ func setTableResourceModel(ctx context.Context, model *tableResourceModel, table
 		name = model.Name.ValueString()
 	}
 	model.ID = types.StringValue(tableID(database, name))
-	model.CatalogID = types.StringValue(table.ID)
+	model.ServerID = types.StringValue(table.ID)
 	model.Database = types.StringValue(database)
 	model.Name = types.StringValue(name)
 	model.Fields = resourceFieldsValueFromRemote(ctx, model.Fields, table.Schema.Fields, diags)
 	model.PartitionKeys = stringListValue(ctx, table.Schema.PartitionKeys, diags)
 	model.PrimaryKeys = stringListValue(ctx, table.Schema.PrimaryKeys, diags)
-	model.Options = syncManagedTableOptions(ctx, model.Options, table.Schema.Options, diags)
+	model.Options = syncManagedTableOptions(ctx, model.Options, tableOptionsMapWithPrimaryKeys(table.Schema.Options, table.Schema.PrimaryKeys), diags)
+	if model.AllowReplacement.IsNull() {
+		model.AllowReplacement = types.BoolValue(false)
+	}
 	model.ServerOptions = stringMapValue(ctx, table.Schema.Options, diags)
 	model.Comment = stringValueFromPointer(table.Schema.Comment)
 	model.SchemaID = types.Int64Value(table.SchemaID)

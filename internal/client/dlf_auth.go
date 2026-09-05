@@ -329,9 +329,10 @@ func newDLFCredentialProvider(config DLFConfig, httpClient *http.Client) (dlfCre
 			return nil, errors.New("DLF ECS metadata URL must be an absolute HTTP(S) URL")
 		}
 		loader = &ecsDLFTokenLoader{
-			metadataURL: strings.TrimSpace(metadataURL),
+			metadataURL: strings.TrimRight(metadataURL, "/") + "/",
 			roleName:    strings.TrimSpace(config.ECSRoleName),
 			httpClient:  httpClient,
+			now:         config.Now,
 		}
 	}
 
@@ -415,7 +416,10 @@ type ecsDLFTokenLoader struct {
 	roleName    string
 	httpClient  *http.Client
 
-	mu sync.Mutex
+	mu             sync.Mutex
+	token          string
+	tokenExpiresAt time.Time
+	now            func() time.Time
 }
 
 func (l *ecsDLFTokenLoader) Load(ctx context.Context) (dlfCredentials, error) {
@@ -446,30 +450,81 @@ func (l *ecsDLFTokenLoader) Load(ctx context.Context) (dlfCredentials, error) {
 	return credentials, nil
 }
 
-func (l *ecsDLFTokenLoader) getText(ctx context.Context, endpoint string, limit int64) (string, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+const ecsMetadataTokenTTL = 6 * time.Hour
+
+func (l *ecsDLFTokenLoader) metadataToken(ctx context.Context) (string, error) {
+	now := time.Now()
+	if l.now != nil {
+		now = l.now()
+	}
+	if l.token != "" && now.Before(l.tokenExpiresAt.Add(-time.Minute)) {
+		return l.token, nil
+	}
+	endpoint, err := url.Parse(l.metadataURL)
 	if err != nil {
-		return "", errors.New("create metadata request")
+		return "", errors.New("invalid ECS metadata endpoint")
+	}
+	endpoint.Path = "/latest/api/token"
+	endpoint.RawPath, endpoint.RawQuery, endpoint.Fragment = "", "", ""
+	token, _, err := l.metadataRequest(ctx, http.MethodPut, endpoint.String(), "", 4<<10)
+	if err != nil {
+		return "", fmt.Errorf("obtain ECS metadata token: %w", err)
+	}
+	token = strings.TrimSpace(token)
+	if token == "" || strings.IndexFunc(token, func(r rune) bool { return r < 0x21 || r > 0x7e }) >= 0 {
+		return "", errors.New("ECS metadata returned an invalid access token")
+	}
+	l.token, l.tokenExpiresAt = token, now.Add(ecsMetadataTokenTTL)
+
+	return token, nil
+}
+
+func (l *ecsDLFTokenLoader) getText(ctx context.Context, endpoint string, limit int64) (string, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := l.metadataToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		contents, status, err := l.metadataRequest(ctx, http.MethodGet, endpoint, token, limit)
+		if attempt == 0 && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
+			l.token = ""
+
+			continue
+		}
+
+		return contents, err
+	}
+
+	return "", errors.New("ECS metadata authentication failed")
+}
+
+func (l *ecsDLFTokenLoader) metadataRequest(ctx context.Context, method, endpoint, token string, limit int64) (string, int, error) {
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
+	if err != nil {
+		return "", 0, errors.New("create metadata request")
+	}
+	if method == http.MethodPut {
+		request.Header.Set("X-aliyun-ecs-metadata-token-ttl-seconds", "21600")
+	} else {
+		request.Header.Set("X-aliyun-ecs-metadata-token", token)
 	}
 	response, err := l.httpClient.Do(request)
 	if err != nil {
-		return "", errors.New("call metadata service")
+		return "", 0, errors.New("call metadata service")
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, limit))
-
-		return "", fmt.Errorf("metadata service returned HTTP %d", response.StatusCode)
+		return "", response.StatusCode, fmt.Errorf("metadata service returned HTTP %d", response.StatusCode)
 	}
 	contents, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
-		return "", errors.New("read metadata response")
+		return "", response.StatusCode, errors.New("read metadata response")
 	}
 	if int64(len(contents)) > limit {
-		return "", errors.New("metadata response exceeded size limit")
+		return "", response.StatusCode, errors.New("metadata response exceeded size limit")
 	}
 
-	return string(contents), nil
+	return string(contents), response.StatusCode, nil
 }
 
 func signDLFDefault(method, resourcePath string, query url.Values, body []byte, credentials dlfCredentials, region string, now time.Time) (map[string]string, error) {

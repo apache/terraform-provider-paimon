@@ -188,11 +188,12 @@ func TestRowFilterResourceLifecyclePreservesEquivalentJSON(t *testing.T) {
 	require.False(t, schemaResponse.Diagnostics.HasError(), schemaResponse.Diagnostics.Errors())
 	configuredPredicate := `{ "op": "eq", "field": "tenant_id" }`
 	planModel := rowFilterResourceModel{
-		ID:        types.StringUnknown(),
-		Database:  types.StringValue("analytics"),
-		Table:     types.StringValue("events"),
-		Principal: types.StringValue("role:analyst"),
-		Predicate: types.StringValue(configuredPredicate),
+		AllowNonAtomicUpdate: types.BoolValue(true),
+		ID:                   types.StringUnknown(),
+		Database:             types.StringValue("analytics"),
+		Table:                types.StringValue("events"),
+		Principal:            types.StringValue("role:analyst"),
+		Predicate:            types.StringValue(configuredPredicate),
 	}
 	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
 	require.False(t, plan.Set(ctx, &planModel).HasError())
@@ -272,12 +273,13 @@ func TestColumnMaskResourceLifecycle(t *testing.T) {
 	var schemaResponse resource.SchemaResponse
 	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
 	planModel := columnMaskResourceModel{
-		ID:        types.StringUnknown(),
-		Database:  types.StringValue("analytics"),
-		Table:     types.StringValue("events"),
-		Principal: types.StringValue("role:analyst"),
-		Column:    types.StringValue("email"),
-		Transform: types.StringValue(`{"type":"null"}`),
+		AllowNonAtomicUpdate: types.BoolValue(true),
+		ID:                   types.StringUnknown(),
+		Database:             types.StringValue("analytics"),
+		Table:                types.StringValue("events"),
+		Principal:            types.StringValue("role:analyst"),
+		Column:               types.StringValue("email"),
+		Transform:            types.StringValue(`{"type":"null"}`),
 	}
 	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
 	require.False(t, plan.Set(ctx, &planModel).HasError())
@@ -337,11 +339,12 @@ func TestRowFilterUpdateRestoresPreviousPolicyWhenReplacementFails(t *testing.T)
 	var schemaResponse resource.SchemaResponse
 	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
 	stateModel := rowFilterResourceModel{
-		ID:        types.StringValue("database=analytics&principal=role%3Aanalyst&table=events"),
-		Database:  types.StringValue("analytics"),
-		Table:     types.StringValue("events"),
-		Principal: types.StringValue("role:analyst"),
-		Predicate: types.StringValue(`{"version":"old"}`),
+		AllowNonAtomicUpdate: types.BoolValue(true),
+		ID:                   types.StringValue("database=analytics&principal=role%3Aanalyst&table=events"),
+		Database:             types.StringValue("analytics"),
+		Table:                types.StringValue("events"),
+		Principal:            types.StringValue("role:analyst"),
+		Predicate:            types.StringValue(`{"version":"old"}`),
 	}
 	planModel := stateModel
 	planModel.Predicate = types.StringValue(`{"version":"new"}`)
@@ -789,11 +792,13 @@ func TestPolicyCreateReconcilesLostResponse(t *testing.T) {
 
 			api, err := client.New(client.Config{URI: server.URL})
 			require.NoError(t, err)
-			result := createPolicyWithReconciliation(context.Background(), api, test.spec)
+			result := createPolicyWithReconciliation(context.Background(), api, test.spec, false)
 			require.True(t, result.accepted)
 			require.NoError(t, result.err)
 			require.NotNil(t, result.observed)
-			assert.True(t, test.spec.matches(*result.observed))
+			matches, matchErr := test.spec.matchesWithSchema(context.Background(), api, *result.observed)
+			require.NoError(t, matchErr)
+			assert.True(t, matches)
 			assert.NotEmpty(t, result.warning)
 		})
 	}
@@ -867,7 +872,9 @@ func TestPolicyReplacementRecoversCanceledDrop(t *testing.T) {
 			require.NoError(t, result.err)
 			mu.Lock()
 			require.NotNil(t, remote)
-			assert.True(t, test.desired.matches(*remote))
+			matches, matchErr := test.desired.matchesWithSchema(context.Background(), api, *remote)
+			require.NoError(t, matchErr)
+			assert.True(t, matches)
 			mu.Unlock()
 		})
 	}
