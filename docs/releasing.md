@@ -31,6 +31,7 @@ private key.
 - Commit access to `dist.apache.org/repos/dist/dev/paimon` and PMC access for
   `dist.apache.org/repos/dist/release/paimon`.
 - `git`, `svn`, `gh`, `gpg`, Go, Terraform, and `shasum` on `PATH`.
+- OpenTofu and Python 3 for the public Registry installation check.
 - A clean checkout whose `origin` is the Apache repository.
 
 Before cutting a candidate, run:
@@ -41,7 +42,12 @@ Before cutting a candidate, run:
 make check
 make check-license
 make test-acceptance
+make test-acceptance-tofu
 ```
+
+Complete the [production validation matrix](production-readiness.md) against
+each supported real Catalog/DLF and query-engine deployment, recording exact
+versions and job results before claiming production compatibility.
 
 Commit any refreshed `LICENSE-binary`, `NOTICE-binary`, or `licenses-binary/`
 files. They describe the code statically linked into every convenience binary.
@@ -83,3 +89,18 @@ ASF `dist/release`, and creates the final GitHub Release from the already-voted
 assets. Nothing is rebuilt. Confirm the release appears in both registries,
 record it in the ASF reporter, and send an announcement to the Paimon mailing
 list.
+
+After each Registry has indexed the final version, verify installation from a
+fresh directory without development overrides or a local plugin mirror:
+
+```bash
+./dev/release/verify_registry.sh 0.1.0 terraform
+./dev/release/verify_registry.sh 0.1.0 tofu
+```
+
+The script pins the requested version, runs the CLI's normal Registry download
+and checksum/signature verification, validates configuration, and checks all
+five resource and two data-source schemas. It does not contact a Catalog or
+create resources. A missing or unindexed release must fail this check; do not
+substitute a local binary when recording distribution evidence. Retain the
+output and the release signing-key identity with the release verification.

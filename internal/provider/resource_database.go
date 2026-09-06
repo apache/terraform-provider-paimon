@@ -42,7 +42,7 @@ type databaseResource struct {
 
 type databaseResourceModel struct {
 	ID            types.String `tfsdk:"id"`
-	CatalogID     types.String `tfsdk:"catalog_id"`
+	ServerID      types.String `tfsdk:"server_id"`
 	Name          types.String `tfsdk:"name"`
 	Options       types.Map    `tfsdk:"options"`
 	ServerOptions types.Map    `tfsdk:"server_options"`
@@ -71,7 +71,7 @@ func (r *databaseResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				Computed:      true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"catalog_id": schema.StringAttribute{Description: "Server-assigned database identifier.", Computed: true},
+			"server_id": schema.StringAttribute{Description: "Server-assigned database identifier.", Computed: true},
 			"name": schema.StringAttribute{
 				Description:   "Database name.",
 				Required:      true,
@@ -185,12 +185,18 @@ func (r *databaseResource) Update(ctx context.Context, req resource.UpdateReques
 		return
 	}
 	removals, updates := diffOptions(before, after)
+	stableCtx := context.WithoutCancel(ctx)
+	resp.Diagnostics.Append(resp.State.Set(stableCtx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ready := func(observed *client.Database) bool {
+		return databaseMatchesOptions(observed, plan.Name.ValueString(), after, false) && optionsConverged(observed.Options, after, removals)
+	}
 	if len(removals) > 0 || len(updates) > 0 {
 		if err := r.client.AlterDatabase(ctx, plan.Name.ValueString(), removals, updates); err != nil {
 			if client.IsMutationOutcomeUncertain(err) {
-				database, recoveryErr := r.lookupAfterMutation(ctx, plan.Name.ValueString(), func(observed *client.Database) bool {
-					return databaseMatchesOptions(observed, plan.Name.ValueString(), after, false)
-				})
+				database, recoveryErr := r.lookupAfterMutation(ctx, plan.Name.ValueString(), ready)
 				if recoveryErr == nil {
 					stableCtx := context.WithoutCancel(ctx)
 					setDatabaseResourceModel(stableCtx, &plan, database, &resp.Diagnostics)
@@ -205,17 +211,9 @@ func (r *databaseResource) Update(ctx context.Context, req resource.UpdateReques
 			return
 		}
 	}
-	stableCtx := context.WithoutCancel(ctx)
-	plan.ID = types.StringValue(plan.Name.ValueString())
-	resp.Diagnostics.Append(resp.State.Set(stableCtx, &plan)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	database, err := r.lookupAfterMutation(ctx, plan.Name.ValueString(), func(observed *client.Database) bool {
-		return databaseMatchesOptions(observed, plan.Name.ValueString(), after, false)
-	})
+	database, err := r.lookupAfterMutation(ctx, plan.Name.ValueString(), ready)
 	if err != nil {
-		resp.Diagnostics.AddError("Unable to verify Paimon database after update", err.Error()+". Terraform retained the planned database state.")
+		resp.Diagnostics.AddError("Unable to verify Paimon database after update", err.Error()+". Terraform retained the previous state so unverified removals remain managed.")
 
 		return
 	}
@@ -240,7 +238,7 @@ func (r *databaseResource) ImportState(ctx context.Context, req resource.ImportS
 }
 
 func (r *databaseResource) lookupAfterMutation(ctx context.Context, name string, ready func(*client.Database) bool) (*client.Database, error) {
-	recoveryCtx, cancel := mutationRecoveryContext(ctx)
+	recoveryCtx, cancel := mutationRecoveryContext(ctx, r.client)
 	defer cancel()
 	database, found, converged, err := retryLookupUntil(recoveryCtx, func(attemptCtx context.Context) (*client.Database, bool, error) {
 		observed, lookupErr := r.client.GetDatabase(attemptCtx, name)
@@ -267,18 +265,13 @@ func databaseMatchesOptions(database *client.Database, name string, options map[
 	if database == nil || database.Name != name || exact && len(database.Options) != len(options) {
 		return false
 	}
-	for key, value := range options {
-		if database.Options[key] != value {
-			return false
-		}
-	}
 
-	return true
+	return optionsConverged(database.Options, options, nil)
 }
 
 func setDatabaseResourceModel(ctx context.Context, model *databaseResourceModel, database *client.Database, diags *diag.Diagnostics) {
 	model.ID = types.StringValue(database.Name)
-	model.CatalogID = types.StringValue(database.ID)
+	model.ServerID = types.StringValue(database.ID)
 	model.Name = types.StringValue(database.Name)
 	model.Options = syncManagedOptions(ctx, model.Options, database.Options, diags)
 	model.ServerOptions = stringMapValue(ctx, database.Options, diags)

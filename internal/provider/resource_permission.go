@@ -346,7 +346,7 @@ func (r *permissionResource) readIntoState(ctx context.Context, model *permissio
 }
 
 func (r *permissionResource) readAfterMutation(ctx context.Context, model *permissionResourceModel, expected client.PermissionAssignment, diags *diag.Diagnostics) bool {
-	recoveryCtx, cancel := mutationRecoveryContext(ctx)
+	recoveryCtx, cancel := mutationRecoveryContext(ctx, r.client)
 	defer cancel()
 	assignment, found, converged, err := retryLookupUntil(recoveryCtx, func(attemptCtx context.Context) (client.PermissionAssignment, bool, error) {
 		return r.lookup(attemptCtx, *model)
@@ -374,7 +374,7 @@ func (r *permissionResource) readAfterMutation(ctx context.Context, model *permi
 }
 
 func (r *permissionResource) reconcileFailedGrant(ctx context.Context, model permissionResourceModel, expected client.PermissionAssignment, grantErr error) (client.PermissionAssignment, bool, error) {
-	recoveryCtx, cancel := mutationRecoveryContext(ctx)
+	recoveryCtx, cancel := mutationRecoveryContext(ctx, r.client)
 	defer cancel()
 	observed, found, converged, reconcileErr := retryLookupUntil(recoveryCtx, func(attemptCtx context.Context) (client.PermissionAssignment, bool, error) {
 		return r.lookup(attemptCtx, model)

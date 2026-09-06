@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,22 +45,25 @@ const (
 var errMutationOutcomeUncertain = errors.New("call Paimon REST API")
 
 type Config struct {
-	URI          string
-	Warehouse    string
-	AuthProvider string
-	Token        string
-	DLF          *DLFConfig
-	Prefix       string
-	Headers      map[string]string
-	HTTPClient   *http.Client
+	URI             string
+	Warehouse       string
+	AuthProvider    string
+	Token           string
+	DLF             *DLFConfig
+	Prefix          string
+	Headers         map[string]string
+	HTTPClient      *http.Client
+	RequestTimeout  time.Duration
+	RecoveryTimeout time.Duration
 }
 
 type Client struct {
-	baseURL    *url.URL
-	warehouse  string
-	userPrefix string
-	httpClient *http.Client
-	auth       requestAuthenticator
+	baseURL         *url.URL
+	warehouse       string
+	userPrefix      string
+	httpClient      *http.Client
+	auth            requestAuthenticator
+	recoveryTimeout time.Duration
 
 	mu         sync.Mutex
 	configured bool
@@ -68,19 +72,50 @@ type Client struct {
 }
 
 type APIError struct {
-	StatusCode   int
+	StatusCode   int     `json:"-"`
 	Code         int     `json:"code"`
 	Message      string  `json:"message"`
 	ResourceType *string `json:"resourceType"`
 	ResourceName *string `json:"resourceName"`
+	RequestID    string  `json:"-"`
 }
 
 func (e *APIError) Error() string {
+	detail := fmt.Sprintf("Paimon REST API returned HTTP %d", e.StatusCode)
 	if e.Code != 0 {
-		return fmt.Sprintf("Paimon REST API returned HTTP %d with code %d", e.StatusCode, e.Code)
+		detail += fmt.Sprintf(" with code %d", e.Code)
+	}
+	if e.RequestID != "" {
+		detail += " (request ID " + e.RequestID + ")"
 	}
 
-	return fmt.Sprintf("Paimon REST API returned HTTP %d", e.StatusCode)
+	return detail
+}
+
+var requestIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// Only expose conventional UUID correlation IDs, never arbitrary response text
+// or an echoed authentication header.
+func safeResponseRequestID(response *http.Response) string {
+	for _, name := range []string{"X-Acs-Request-Id", "X-Dlf-Request-Id", "X-Request-Id"} {
+		candidate := response.Header.Get(name)
+		if !requestIDPattern.MatchString(candidate) {
+			continue
+		}
+		if response.Request != nil {
+			for _, values := range response.Request.Header {
+				for _, value := range values {
+					if strings.Contains(value, candidate) {
+						return ""
+					}
+				}
+			}
+		}
+
+		return candidate
+	}
+
+	return ""
 }
 
 func IsNotFound(err error) bool {
@@ -116,6 +151,12 @@ func New(config Config) (*Client, error) {
 	}
 
 	httpClient := noRedirectHTTPClient(config.HTTPClient)
+	if config.RequestTimeout < 0 || config.RecoveryTimeout < 0 {
+		return nil, errors.New("request and recovery timeouts must be positive")
+	}
+	if config.RequestTimeout > 0 {
+		httpClient.Timeout = config.RequestTimeout
+	}
 
 	configuredAuth := strings.ToLower(strings.TrimSpace(config.AuthProvider))
 	if configuredAuth == "" && config.Token != "" {
@@ -151,14 +192,24 @@ func New(config Config) (*Client, error) {
 	}
 
 	return &Client{
-		baseURL:    baseURL,
-		warehouse:  config.Warehouse,
-		userPrefix: config.Prefix,
-		httpClient: httpClient,
-		auth:       auth,
-		prefix:     config.Prefix,
-		headers:    cloneMap(config.Headers),
+		baseURL:         baseURL,
+		warehouse:       config.Warehouse,
+		userPrefix:      config.Prefix,
+		httpClient:      httpClient,
+		recoveryTimeout: config.RecoveryTimeout,
+		auth:            auth,
+		prefix:          config.Prefix,
+		headers:         cloneMap(config.Headers),
 	}, nil
+}
+
+// RecoveryTimeout bounds provider reconciliation separately from each request.
+func (c *Client) RecoveryTimeout() time.Duration {
+	if c == nil || c.recoveryTimeout == 0 {
+		return 5 * time.Second
+	}
+
+	return c.recoveryTimeout
 }
 
 func (c *Client) CreateDatabase(ctx context.Context, name string, options map[string]string) error {
@@ -348,7 +399,7 @@ func (c *Client) doRaw(ctx context.Context, method string, segments []string, qu
 	defer response.Body.Close()
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		apiErr := &APIError{StatusCode: response.StatusCode}
+		apiErr := &APIError{StatusCode: response.StatusCode, RequestID: safeResponseRequestID(response)}
 		limited := io.LimitReader(response.Body, 1<<20)
 		if err := json.NewDecoder(limited).Decode(apiErr); err != nil && err != io.EOF {
 			apiErr.Message = http.StatusText(response.StatusCode)
@@ -357,6 +408,12 @@ func (c *Client) doRaw(ctx context.Context, method string, segments []string, qu
 		return apiErr
 	}
 
+	// Mutations do not consume a response representation. Once the server has
+	// confirmed success, a truncated unused body must not turn it into a failed
+	// create with no Terraform identity. The resource verifies state by reading it.
+	if result == nil || response.StatusCode == http.StatusNoContent {
+		return nil
+	}
 	contents, err := io.ReadAll(io.LimitReader(response.Body, maxAPIResponseBodySize+1))
 	if err != nil {
 		return errors.New("read Paimon REST response")
@@ -365,9 +422,6 @@ func (c *Client) doRaw(ctx context.Context, method string, segments []string, qu
 		return errors.New("Paimon REST response exceeded 16 MiB size limit")
 	}
 
-	if result == nil || response.StatusCode == http.StatusNoContent {
-		return nil
-	}
 	if err := json.Unmarshal(contents, result); err != nil {
 		return fmt.Errorf("decode Paimon REST response: %w", err)
 	}

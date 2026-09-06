@@ -203,7 +203,7 @@ func TestReservedTableOptionsValidator(t *testing.T) {
 		ConfigValue: options,
 	}, &response)
 	require.True(t, response.Diagnostics.HasError())
-	assert.Contains(t, response.Diagnostics.Errors()[0].Detail(), "partition, primary-key")
+	assert.Contains(t, response.Diagnostics.Errors()[0].Detail(), "Do not configure partition in options")
 }
 
 func TestImmutableTableOptionsChanged(t *testing.T) {
@@ -401,7 +401,7 @@ func TestTableResourceLifecycle(t *testing.T) {
 	require.False(t, diagnostics.HasError(), diagnostics.Errors())
 	planModel := tableResourceModel{
 		ID:            types.StringUnknown(),
-		CatalogID:     types.StringUnknown(),
+		ServerID:      types.StringUnknown(),
 		Database:      types.StringValue("analytics"),
 		Name:          types.StringValue("events"),
 		Fields:        fields,
@@ -484,7 +484,7 @@ func TestDatabaseCreateRetainsIdentityWhenReadBackFails(t *testing.T) {
 
 	planModel := databaseResourceModel{
 		ID:            types.StringUnknown(),
-		CatalogID:     types.StringUnknown(),
+		ServerID:      types.StringUnknown(),
 		Name:          types.StringValue("analytics"),
 		Options:       types.MapNull(types.StringType),
 		ServerOptions: types.MapUnknown(types.StringType),

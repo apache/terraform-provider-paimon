@@ -34,7 +34,7 @@ type tableDataSource struct {
 
 type tableDataSourceModel struct {
 	ID            types.String `tfsdk:"id"`
-	CatalogID     types.String `tfsdk:"catalog_id"`
+	ServerID      types.String `tfsdk:"server_id"`
 	Database      types.String `tfsdk:"database"`
 	Name          types.String `tfsdk:"name"`
 	Fields        types.List   `tfsdk:"fields"`
@@ -92,7 +92,7 @@ func (d *tableDataSource) Read(ctx context.Context, req datasource.ReadRequest, 
 		name = data.Name.ValueString()
 	}
 	data.ID = types.StringValue(tableID(database, name))
-	data.CatalogID = types.StringValue(table.ID)
+	data.ServerID = types.StringValue(table.ID)
 	data.Database = types.StringValue(database)
 	data.Name = types.StringValue(name)
 	data.Fields = fieldsValueFromRemote(ctx, table.Schema.Fields, &resp.Diagnostics)

@@ -209,7 +209,7 @@ resource "paimon_table" "events" {
   name     = "events"
   fields   = [%s
   ]
-  primary_keys = ["id"]
+  options = { "primary-key" = "id" }
   comment      = %q
 }
 `, uri, owner, fields, comment)
@@ -250,7 +250,8 @@ resource "paimon_table" "events" {
       nullable = true
     }%s
   ]
-  primary_keys = ["id"]
+  options = { "primary-key" = "id" }
+  allow_replacement = true
 }
 `, uri, keyType, requiredField)
 }
@@ -261,6 +262,8 @@ type acceptanceCatalog struct {
 	table            *client.Table
 	databaseCreates  int
 	tableCreates     int
+	tableDeletes     int
+	tableAlters      int
 	nextTableFieldID int
 }
 
@@ -310,6 +313,19 @@ func (c *acceptanceCatalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Schema     client.Schema     `json:"schema"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&request)
+		if primaryKey, configured := request.Schema.Options["primary-key"]; configured {
+			if len(request.Schema.PrimaryKeys) != 0 {
+				http.Error(w, "duplicate DDL and option primary keys", http.StatusBadRequest)
+
+				return
+			}
+			for _, key := range strings.Split(primaryKey, ",") {
+				if key = strings.TrimSpace(key); key != "" {
+					request.Schema.PrimaryKeys = append(request.Schema.PrimaryKeys, key)
+				}
+			}
+			delete(request.Schema.Options, "primary-key")
+		}
 		c.tableCreates++
 		c.table = &client.Table{ID: "table-1", Database: request.Identifier.Database, Name: request.Identifier.Object, SchemaID: 1, Schema: request.Schema}
 		c.nextTableFieldID = nextAcceptanceFieldID(request.Schema.Fields)
@@ -322,6 +338,7 @@ func (c *acceptanceCatalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeAcceptanceJSON(w, c.table)
 	case r.URL.Path == "/v1/catalog/databases/analytics/tables/events" && r.Method == http.MethodPost:
+		c.tableAlters++
 		var request struct {
 			Changes []map[string]json.RawMessage `json:"changes"`
 		}
@@ -330,6 +347,18 @@ func (c *acceptanceCatalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var action string
 			_ = json.Unmarshal(change["action"], &action)
 			switch action {
+			case "setOption":
+				var key, value string
+				_ = json.Unmarshal(change["key"], &key)
+				_ = json.Unmarshal(change["value"], &value)
+				if c.table.Schema.Options == nil {
+					c.table.Schema.Options = make(map[string]string)
+				}
+				c.table.Schema.Options[key] = value
+			case "removeOption":
+				var key string
+				_ = json.Unmarshal(change["key"], &key)
+				delete(c.table.Schema.Options, key)
 			case "updateComment":
 				_ = json.Unmarshal(change["comment"], &c.table.Schema.Comment)
 			case "addColumn":
@@ -362,6 +391,7 @@ func (c *acceptanceCatalog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.table.SchemaID++
 		w.WriteHeader(http.StatusOK)
 	case r.URL.Path == "/v1/catalog/databases/analytics/tables/events" && r.Method == http.MethodDelete:
+		c.tableDeletes++
 		c.table = nil
 		w.WriteHeader(http.StatusNoContent)
 	default:

@@ -29,6 +29,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -37,13 +38,81 @@ import (
 
 const maxSerializedPolicyBytes = 60 * 1024
 
+const nonAtomicPolicyUpdateDetail = "The REST Catalog has no atomic policy update. Changing policy content drops and recreates the policy, leaving an interval without filtering or masking. Stop affected queries first, then explicitly set allow_non_atomic_update = true for the maintenance operation. Rollback cannot eliminate this interval."
+
+func nonAtomicPolicyUpdateAttribute() schema.BoolAttribute {
+	return schema.BoolAttribute{
+		Description: "Permit drop-and-create updates during a controlled maintenance window. Defaults to false because reads can be unfiltered or unmasked between requests.",
+		Optional:    true,
+		Computed:    true,
+		Default:     booldefault.StaticBool(false),
+	}
+}
+
+func (r *rowFilterResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	validatePolicyUpdatePlan(ctx, r.client, req, resp, "predicate")
+}
+
+func (r *columnMaskResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	validatePolicyUpdatePlan(ctx, r.client, req, resp, "transform")
+}
+
+func validatePolicyUpdatePlan(ctx context.Context, api *client.Client, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse, contentAttribute string) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	identities := []string{"database", "table", "principal"}
+	if contentAttribute == "transform" {
+		identities = append(identities, "column")
+	}
+	for _, name := range identities {
+		var previous, planned types.String
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root(name), &previous)...)
+		resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root(name), &planned)...)
+		if resp.Diagnostics.HasError() || planned.IsUnknown() || !previous.Equal(planned) {
+			// Identity changes use replacement. Its destination table may not
+			// exist yet, and this guard only governs in-place content updates.
+			return
+		}
+	}
+	var before, after types.String
+	var allowed types.Bool
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root(contentAttribute), &before)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root(contentAttribute), &after)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("allow_non_atomic_update"), &allowed)...)
+	if resp.Diagnostics.HasError() || before.IsUnknown() || after.IsUnknown() {
+		return
+	}
+	var database, table types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("database"), &database)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("table"), &table)...)
+	if resp.Diagnostics.HasError() || database.IsUnknown() || table.IsUnknown() {
+		return
+	}
+	policyType := client.PolicyTypeRowFilter
+	if contentAttribute == "transform" {
+		policyType = client.PolicyTypeColumnMasking
+	}
+	equal, err := equivalentPolicyContent(ctx, api, policySpec{database: database.ValueString(), table: table.ValueString(), policyType: policyType}, before.ValueString(), after.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to compare Paimon policy", err.Error())
+
+		return
+	}
+	if !equal && !allowed.ValueBool() {
+		resp.Diagnostics.AddAttributeError(path.Root(contentAttribute), "Non-atomic policy update is disabled", nonAtomicPolicyUpdateDetail)
+	}
+}
+
 var (
 	_ resource.Resource                   = &rowFilterResource{}
 	_ resource.ResourceWithImportState    = &rowFilterResource{}
 	_ resource.ResourceWithValidateConfig = &rowFilterResource{}
+	_ resource.ResourceWithModifyPlan     = &rowFilterResource{}
 	_ resource.Resource                   = &columnMaskResource{}
 	_ resource.ResourceWithImportState    = &columnMaskResource{}
 	_ resource.ResourceWithValidateConfig = &columnMaskResource{}
+	_ resource.ResourceWithModifyPlan     = &columnMaskResource{}
 )
 
 type rowFilterResource struct {
@@ -51,11 +120,12 @@ type rowFilterResource struct {
 }
 
 type rowFilterResourceModel struct {
-	ID        types.String `tfsdk:"id"`
-	Database  types.String `tfsdk:"database"`
-	Table     types.String `tfsdk:"table"`
-	Principal types.String `tfsdk:"principal"`
-	Predicate types.String `tfsdk:"predicate"`
+	ID                   types.String `tfsdk:"id"`
+	Database             types.String `tfsdk:"database"`
+	Table                types.String `tfsdk:"table"`
+	Principal            types.String `tfsdk:"principal"`
+	Predicate            types.String `tfsdk:"predicate"`
+	AllowNonAtomicUpdate types.Bool   `tfsdk:"allow_non_atomic_update"`
 }
 
 type columnMaskResource struct {
@@ -63,12 +133,13 @@ type columnMaskResource struct {
 }
 
 type columnMaskResourceModel struct {
-	ID        types.String `tfsdk:"id"`
-	Database  types.String `tfsdk:"database"`
-	Table     types.String `tfsdk:"table"`
-	Principal types.String `tfsdk:"principal"`
-	Column    types.String `tfsdk:"column"`
-	Transform types.String `tfsdk:"transform"`
+	ID                   types.String `tfsdk:"id"`
+	Database             types.String `tfsdk:"database"`
+	Table                types.String `tfsdk:"table"`
+	Principal            types.String `tfsdk:"principal"`
+	Column               types.String `tfsdk:"column"`
+	Transform            types.String `tfsdk:"transform"`
+	AllowNonAtomicUpdate types.Bool   `tfsdk:"allow_non_atomic_update"`
 }
 
 func NewRowFilterResource() resource.Resource {
@@ -88,6 +159,7 @@ func (r *rowFilterResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 	resp.Schema = schema.Schema{
 		Description: "Manages one principal-scoped row-filter policy on a Paimon table. The table must enable query-auth.enabled. The management API is experimental in Paimon.",
 		Attributes: map[string]schema.Attribute{
+			"allow_non_atomic_update": nonAtomicPolicyUpdateAttribute(),
 			"id": schema.StringAttribute{
 				Description:   "Stable URL-query identifier for the row-filter identity.",
 				Computed:      true,
@@ -128,14 +200,14 @@ func (r *rowFilterResource) Create(ctx context.Context, req resource.CreateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	result := createPolicyWithReconciliation(ctx, r.client, rowFilterSpec(plan))
+	result := createPolicyWithReconciliation(ctx, r.client, rowFilterSpec(plan), false)
 	if !result.accepted {
 		resp.Diagnostics.AddError("Unable to create Paimon row filter", result.err.Error())
 
 		return
 	}
 	plan.ID = types.StringValue(rowFilterID(plan))
-	if result.observed != nil && result.observed.RowFilter != nil && !equivalentJSON(plan.Predicate.ValueString(), result.observed.RowFilter.Predicate) {
+	if result.err != nil && result.observed != nil && result.observed.RowFilter != nil && !equivalentJSON(plan.Predicate.ValueString(), result.observed.RowFilter.Predicate) {
 		plan.Predicate = types.StringValue(result.observed.RowFilter.Predicate)
 	}
 	stableCtx := context.WithoutCancel(ctx)
@@ -180,16 +252,27 @@ func (r *rowFilterResource) Update(ctx context.Context, req resource.UpdateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if equivalentJSON(state.Predicate.ValueString(), plan.Predicate.ValueString()) {
+	equal, err := equivalentPolicyContent(ctx, r.client, rowFilterSpec(plan), state.Predicate.ValueString(), plan.Predicate.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to compare Paimon policy", err.Error())
+
+		return
+	}
+	if equal {
 		plan.ID = types.StringValue(rowFilterID(plan))
 		resp.Diagnostics.Append(resp.State.Set(stableCtx, &plan)...)
+
+		return
+	}
+	if !plan.AllowNonAtomicUpdate.ValueBool() {
+		resp.Diagnostics.AddError("Non-atomic policy update is disabled", nonAtomicPolicyUpdateDetail)
 
 		return
 	}
 	result := replacePolicyWithReconciliation(ctx, r.client, rowFilterSpec(state), rowFilterSpec(plan))
 	if result.desired {
 		plan.ID = types.StringValue(rowFilterID(plan))
-		if result.observed != nil && result.observed.RowFilter != nil && !equivalentJSON(plan.Predicate.ValueString(), result.observed.RowFilter.Predicate) {
+		if result.err != nil && result.observed != nil && result.observed.RowFilter != nil && !equivalentJSON(plan.Predicate.ValueString(), result.observed.RowFilter.Predicate) {
 			plan.Predicate = types.StringValue(result.observed.RowFilter.Predicate)
 		}
 		resp.Diagnostics.Append(resp.State.Set(stableCtx, &plan)...)
@@ -242,7 +325,13 @@ func (r *rowFilterResource) readIntoState(ctx context.Context, model *rowFilterR
 		return false
 	}
 	remote := policy.RowFilter.Predicate
-	if model.Predicate.IsNull() || model.Predicate.IsUnknown() || !equivalentJSON(model.Predicate.ValueString(), remote) {
+	equal, err := equivalentPolicyContent(ctx, r.client, rowFilterSpec(*model), model.Predicate.ValueString(), remote)
+	if err != nil {
+		diags.AddError("Unable to compare Paimon policy", err.Error())
+
+		return false
+	}
+	if model.Predicate.IsNull() || model.Predicate.IsUnknown() || !equal {
 		model.Predicate = types.StringValue(remote)
 	}
 	model.ID = types.StringValue(rowFilterID(*model))
@@ -259,6 +348,7 @@ func (r *columnMaskResource) Schema(_ context.Context, _ resource.SchemaRequest,
 	resp.Schema = schema.Schema{
 		Description: "Manages one principal-scoped column-masking policy on a Paimon table. The table must enable query-auth.enabled. The management API is experimental in Paimon.",
 		Attributes: map[string]schema.Attribute{
+			"allow_non_atomic_update": nonAtomicPolicyUpdateAttribute(),
 			"id": schema.StringAttribute{
 				Description:   "Stable URL-query identifier for the column-mask identity.",
 				Computed:      true,
@@ -300,14 +390,14 @@ func (r *columnMaskResource) Create(ctx context.Context, req resource.CreateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	result := createPolicyWithReconciliation(ctx, r.client, columnMaskSpec(plan))
+	result := createPolicyWithReconciliation(ctx, r.client, columnMaskSpec(plan), false)
 	if !result.accepted {
 		resp.Diagnostics.AddError("Unable to create Paimon column mask", result.err.Error())
 
 		return
 	}
 	plan.ID = types.StringValue(columnMaskID(plan))
-	if result.observed != nil && result.observed.ColumnMask != nil && !equivalentJSON(plan.Transform.ValueString(), result.observed.ColumnMask.Transform) {
+	if result.err != nil && result.observed != nil && result.observed.ColumnMask != nil && !equivalentJSON(plan.Transform.ValueString(), result.observed.ColumnMask.Transform) {
 		plan.Transform = types.StringValue(result.observed.ColumnMask.Transform)
 	}
 	stableCtx := context.WithoutCancel(ctx)
@@ -352,16 +442,27 @@ func (r *columnMaskResource) Update(ctx context.Context, req resource.UpdateRequ
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if equivalentJSON(state.Transform.ValueString(), plan.Transform.ValueString()) {
+	equal, err := equivalentPolicyContent(ctx, r.client, columnMaskSpec(plan), state.Transform.ValueString(), plan.Transform.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to compare Paimon policy", err.Error())
+
+		return
+	}
+	if equal {
 		plan.ID = types.StringValue(columnMaskID(plan))
 		resp.Diagnostics.Append(resp.State.Set(stableCtx, &plan)...)
+
+		return
+	}
+	if !plan.AllowNonAtomicUpdate.ValueBool() {
+		resp.Diagnostics.AddError("Non-atomic policy update is disabled", nonAtomicPolicyUpdateDetail)
 
 		return
 	}
 	result := replacePolicyWithReconciliation(ctx, r.client, columnMaskSpec(state), columnMaskSpec(plan))
 	if result.desired {
 		plan.ID = types.StringValue(columnMaskID(plan))
-		if result.observed != nil && result.observed.ColumnMask != nil && !equivalentJSON(plan.Transform.ValueString(), result.observed.ColumnMask.Transform) {
+		if result.err != nil && result.observed != nil && result.observed.ColumnMask != nil && !equivalentJSON(plan.Transform.ValueString(), result.observed.ColumnMask.Transform) {
 			plan.Transform = types.StringValue(result.observed.ColumnMask.Transform)
 		}
 		resp.Diagnostics.Append(resp.State.Set(stableCtx, &plan)...)
@@ -416,7 +517,13 @@ func (r *columnMaskResource) readIntoState(ctx context.Context, model *columnMas
 		return false
 	}
 	remote := policy.ColumnMask.Transform
-	if model.Transform.IsNull() || model.Transform.IsUnknown() || !equivalentJSON(model.Transform.ValueString(), remote) {
+	equal, err := equivalentPolicyContent(ctx, r.client, columnMaskSpec(*model), model.Transform.ValueString(), remote)
+	if err != nil {
+		diags.AddError("Unable to compare Paimon policy", err.Error())
+
+		return false
+	}
+	if model.Transform.IsNull() || model.Transform.IsUnknown() || !equal {
 		model.Transform = types.StringValue(remote)
 	}
 	model.ID = types.StringValue(columnMaskID(*model))
@@ -463,17 +570,6 @@ func columnMaskSpec(model columnMaskResourceModel) policySpec {
 			ColumnMask: &client.ColumnMask{OnColumn: model.Column.ValueString(), Transform: model.Transform.ValueString()},
 			Principal:  model.Principal.ValueString(),
 		},
-	}
-}
-
-func (s policySpec) matches(policy client.DataPolicy) bool {
-	switch s.policyType {
-	case client.PolicyTypeRowFilter:
-		return policy.RowFilter != nil && equivalentJSON(s.content, policy.RowFilter.Predicate)
-	case client.PolicyTypeColumnMasking:
-		return policy.ColumnMask != nil && policy.ColumnMask.OnColumn == s.column && equivalentJSON(s.content, policy.ColumnMask.Transform)
-	default:
-		return false
 	}
 }
 
@@ -529,13 +625,19 @@ type policyCreateResult struct {
 	err      error
 }
 
-func createPolicyWithReconciliation(ctx context.Context, api *client.Client, spec policySpec) policyCreateResult {
+func createPolicyWithReconciliation(ctx context.Context, api *client.Client, spec policySpec, alreadyManaged bool) policyCreateResult {
 	createErr := api.CreatePolicy(ctx, spec.database, spec.table, spec.request)
-	recoveryCtx, cancel := mutationRecoveryContext(ctx)
+	if createErr != nil && !alreadyManaged && !client.IsMutationOutcomeUncertain(createErr) {
+		return policyCreateResult{err: fmt.Errorf("creating the %s was rejected: %w. Import an existing policy explicitly; it has not been adopted into state", spec.label, createErr)}
+	}
+	recoveryCtx, cancel := mutationRecoveryContext(ctx, api)
 	defer cancel()
-	observed, found, converged, reconcileErr := retryLookupUntil(recoveryCtx, func(attemptCtx context.Context) (client.DataPolicy, bool, error) {
-		return lookupPolicy(attemptCtx, api, spec)
-	}, spec.matches)
+	observation, found, converged, reconcileErr := retryLookupUntil(recoveryCtx, func(attemptCtx context.Context) (policyLookupObservation, bool, error) {
+		observation, err := observePolicy(attemptCtx, api, spec)
+
+		return observation, observation.found, err
+	}, func(observation policyLookupObservation) bool { return observation.matches })
+	observed := observation.policy
 	if createErr == nil {
 		result := policyCreateResult{accepted: true}
 		if reconcileErr != nil {
@@ -580,39 +682,41 @@ type policyReplacementResult struct {
 }
 
 type policyLookupObservation struct {
-	policy client.DataPolicy
-	found  bool
+	policy  client.DataPolicy
+	found   bool
+	matches bool
 }
 
 func replacePolicyWithReconciliation(ctx context.Context, api *client.Client, previous, desired policySpec) policyReplacementResult {
 	mutationCtx := ctx
 	dropErr := api.DropPolicy(ctx, desired.database, desired.table, desired.policyType, desired.principal, desired.column)
 	if dropErr != nil && !client.IsNotFound(dropErr) {
-		recoveryCtx, cancel := mutationRecoveryContext(ctx)
+		recoveryCtx, cancel := mutationRecoveryContext(ctx, api)
 		defer cancel()
 		observation, _, _, reconcileErr := retryLookupUntil(recoveryCtx, func(attemptCtx context.Context) (policyLookupObservation, bool, error) {
-			observed, found, lookupErr := lookupPolicy(attemptCtx, api, desired)
-			if lookupErr != nil {
-				return policyLookupObservation{}, false, lookupErr
-			}
+			observation, err := observePolicy(attemptCtx, api, desired)
 
-			return policyLookupObservation{policy: observed, found: found}, true, nil
+			return observation, true, err
 		}, func(observed policyLookupObservation) bool {
-			return !observed.found || desired.matches(observed.policy)
+			return !observed.found || observed.matches
 		})
 		if reconcileErr != nil {
 			return policyReplacementResult{err: fmt.Errorf("dropping the previous %s returned an error (%s), and bounded reconciliation could not establish the remote state: %w", previous.label, dropErr, reconcileErr)}
 		}
 		if observation.found {
 			observed := observation.policy
+			previousMatches, err := previous.matchesWithSchema(recoveryCtx, api, observed)
+			if err != nil {
+				return policyReplacementResult{err: err}
+			}
 			switch {
-			case desired.matches(observed):
+			case observation.matches:
 				return policyReplacementResult{
 					desired:  true,
 					observed: &observed,
 					warning:  fmt.Sprintf("Dropping the previous %s returned an error, but reconciliation found the exact replacement already attached.", previous.label),
 				}
-			case previous.matches(observed):
+			case previousMatches:
 				return policyReplacementResult{observed: &observed, err: fmt.Errorf("dropping the previous %s failed and reconciliation confirmed that it remains attached: %w", previous.label, dropErr)}
 			default:
 				return policyReplacementResult{observed: &observed, err: fmt.Errorf("dropping the previous %s returned an error (%s), and reconciliation found unexpected policy content for the same identity", previous.label, dropErr)}
@@ -621,21 +725,25 @@ func replacePolicyWithReconciliation(ctx context.Context, api *client.Client, pr
 		mutationCtx = context.WithoutCancel(ctx)
 	}
 
-	created := createPolicyWithReconciliation(mutationCtx, api, desired)
+	created := createPolicyWithReconciliation(mutationCtx, api, desired, true)
 	if created.accepted {
 		return policyReplacementResult{desired: true, observed: created.observed, warning: created.warning, err: created.err}
 	}
 	if created.observed != nil {
-		if previous.matches(*created.observed) {
+		matches, err := previous.matchesWithSchema(ctx, api, *created.observed)
+		if err != nil {
+			return policyReplacementResult{observed: created.observed, err: err}
+		}
+		if matches {
 			return policyReplacementResult{observed: created.observed, err: fmt.Errorf("creating the replacement failed, but reconciliation confirmed that the previous %s remains attached: %w", previous.label, created.err)}
 		}
 
 		return policyReplacementResult{observed: created.observed, err: fmt.Errorf("creating the replacement failed, and reconciliation found unexpected policy content for the same identity: %w", created.err)}
 	}
 
-	recoveryCtx, cancel := mutationRecoveryContext(ctx)
+	recoveryCtx, cancel := mutationRecoveryContext(ctx, api)
 	defer cancel()
-	restored := createPolicyWithReconciliation(recoveryCtx, api, previous)
+	restored := createPolicyWithReconciliation(recoveryCtx, api, previous, true)
 	if restored.accepted {
 		detail := fmt.Sprintf("creating the replacement failed (%s), so the previous %s was restored", created.err, previous.label)
 		if restored.err != nil {
@@ -644,7 +752,15 @@ func replacePolicyWithReconciliation(ctx context.Context, api *client.Client, pr
 
 		return policyReplacementResult{observed: restored.observed, err: fmt.Errorf("%s", detail)}
 	}
-	if restored.observed != nil && desired.matches(*restored.observed) {
+	restoredDesired := false
+	if restored.observed != nil {
+		var err error
+		restoredDesired, err = desired.matchesWithSchema(recoveryCtx, api, *restored.observed)
+		if err != nil {
+			return policyReplacementResult{observed: restored.observed, err: err}
+		}
+	}
+	if restoredDesired {
 		return policyReplacementResult{
 			desired:  true,
 			observed: restored.observed,

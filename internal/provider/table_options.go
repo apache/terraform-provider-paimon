@@ -19,9 +19,11 @@ package provider
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/mapplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -57,11 +59,11 @@ var immutableTableOptions = map[string]struct{}{
 type reservedTableOptionsValidator struct{}
 
 func (reservedTableOptionsValidator) Description(context.Context) string {
-	return "must configure primary keys and partitions with their first-class attributes"
+	return "must configure partitions with partition_keys"
 }
 
 func (reservedTableOptionsValidator) MarkdownDescription(context.Context) string {
-	return "must configure primary keys and partitions with `primary_keys` and `partition_keys`"
+	return "must configure partitions with `partition_keys`"
 }
 
 func (reservedTableOptionsValidator) ValidateMap(_ context.Context, req validator.MapRequest, resp *validator.MapResponse) {
@@ -69,7 +71,7 @@ func (reservedTableOptionsValidator) ValidateMap(_ context.Context, req validato
 		return
 	}
 	reserved := make([]string, 0, 2)
-	for _, key := range []string{"partition", "primary-key"} {
+	for _, key := range []string{"partition"} {
 		if _, exists := req.ConfigValue.Elements()[key]; exists {
 			reserved = append(reserved, key)
 		}
@@ -78,13 +80,49 @@ func (reservedTableOptionsValidator) ValidateMap(_ context.Context, req validato
 		resp.Diagnostics.AddAttributeError(
 			req.Path,
 			"Reserved Paimon table option",
-			"Do not configure "+strings.Join(reserved, ", ")+" in options. Use partition_keys and primary_keys instead.",
+			"Do not configure "+strings.Join(reserved, ", ")+" in options. Use partition_keys instead; primary keys use options[\"primary-key\"].",
 		)
 	}
 }
 
-func immutableTableOptionsRequiresReplace(_ context.Context, req planmodifier.MapRequest, resp *mapplanmodifier.RequiresReplaceIfFuncResponse) {
-	resp.RequiresReplace = immutableTableOptionsChanged(req.StateValue, req.PlanValue)
+func immutableTableOptionsRequiresReplace(ctx context.Context, req planmodifier.MapRequest, resp *mapplanmodifier.RequiresReplaceIfFuncResponse) {
+	var remote types.Map
+	var allowed types.Bool
+	var keys types.List
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("server_options"), &remote)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("allow_replacement"), &allowed)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("primary_keys"), &keys)...)
+	before := effectiveManagedTableOptions(req.StateValue, req.PlanValue, tableOptionsWithPrimaryKeys(ctx, remote, keys, &resp.Diagnostics))
+	if immutableTableOptionsChanged(before, req.PlanValue) {
+		if !allowed.ValueBool() {
+			resp.Diagnostics.AddAttributeError(req.Path, "Destructive table change is disabled", "Changing an immutable option requires dropping and recreating the table and can delete its data. Use a data migration, or explicitly set allow_replacement = true to permit replacement.")
+
+			return
+		}
+		resp.RequiresReplace = true
+	}
+}
+
+// Starting to manage an existing option is not a remote change. Only include
+// newly managed keys so unrelated server options never become removal targets.
+func effectiveManagedTableOptions(before, after, remote types.Map) types.Map {
+	if before.IsUnknown() || after.IsUnknown() || remote.IsUnknown() {
+		return before
+	}
+	values := before.Elements()
+	remoteValues := remote.Elements()
+	for key := range after.Elements() {
+		if _, managed := values[key]; !managed {
+			if value, exists := remoteValues[key]; exists {
+				values[key] = value
+			}
+		}
+	}
+
+	return types.MapValueMust(types.StringType, values)
 }
 
 func immutableTableOptionsChanged(before, after types.Map) bool {
@@ -92,6 +130,13 @@ func immutableTableOptionsChanged(before, after types.Map) bool {
 		beforeValue, beforeExists, beforeKnown := knownTableOption(before, key)
 		afterValue, afterExists, afterKnown := knownTableOption(after, key)
 		if !beforeKnown || !afterKnown {
+			continue
+		}
+		if key == "primary-key" {
+			if !slices.Equal(parsePrimaryKeyOption(beforeValue), parsePrimaryKeyOption(afterValue)) {
+				return true
+			}
+
 			continue
 		}
 		if key == "type" {
@@ -135,7 +180,19 @@ func knownTableOption(options types.Map, key string) (string, bool, bool) {
 }
 
 func diffTableOptions(before, after map[string]string) ([]string, map[string]string) {
-	removals, updates := diffOptions(before, after)
+	filteredBefore := make(map[string]string, len(before))
+	filteredAfter := make(map[string]string, len(after))
+	for key, value := range before {
+		if key != "primary-key" {
+			filteredBefore[key] = value
+		}
+	}
+	for key, value := range after {
+		if key != "primary-key" {
+			filteredAfter[key] = value
+		}
+	}
+	removals, updates := diffOptions(filteredBefore, filteredAfter)
 	beforeType, beforeExists := before["type"]
 	if !beforeExists {
 		beforeType = "table"
@@ -163,6 +220,7 @@ func syncManagedTableOptions(ctx context.Context, managed types.Map, remote map[
 	if managed.IsNull() || managed.IsUnknown() || diags.HasError() {
 		return synced
 	}
+	synced = retainPrimaryKeyOptionSpelling(managed, synced, remote)
 	managedOptions := mapFromValue(ctx, managed, diags)
 	configuredType, managesType := managedOptions["type"]
 	if !managesType || diags.HasError() {
