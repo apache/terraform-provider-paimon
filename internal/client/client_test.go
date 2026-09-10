@@ -121,6 +121,402 @@ func TestClientDoesNotExposeRemoteErrorMessage(t *testing.T) {
 	assert.NotContains(t, err.Error(), "secret-token")
 }
 
+// errorServer answers every non-config request with the given error.
+func errorServer(t *testing.T, status int, body map[string]any) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/config" {
+			writeJSON(t, w, ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}})
+
+			return
+		}
+		w.WriteHeader(status)
+		writeJSON(t, w, body)
+	}))
+	t.Cleanup(server.Close)
+
+	return server
+}
+
+func TestClientNamesMissingResourceFromStructuredErrorFields(t *testing.T) {
+	server := errorServer(t, http.StatusNotFound, map[string]any{
+		"resourceType": "USER",
+		"resourceName": "user:analyst",
+		"message":      "User user:analyst does not exist.",
+		"code":         404,
+	})
+	defer server.Close()
+
+	api, err := New(Config{URI: server.URL, Token: "secret-token"})
+	require.NoError(t, err)
+	err = api.GrantPermission(context.Background(), PermissionAssignment{
+		Resource:  PermissionResource{Type: ResourceTypeTable, Database: "analytics", Table: "events"},
+		Access:    PermissionAccessSelect,
+		Principal: "user:analyst",
+	})
+	require.Error(t, err)
+	assert.EqualError(t, err, `Paimon REST API returned HTTP 404 with code 404: USER "user:analyst" not found`)
+	assert.NotContains(t, err.Error(), "does not exist")
+}
+
+func TestClientNamesResourceNeutrallyOnOtherStatuses(t *testing.T) {
+	server := errorServer(t, http.StatusConflict, map[string]any{
+		"resourceType": "TABLE",
+		"resourceName": "analytics.events",
+		"code":         409,
+	})
+	defer server.Close()
+
+	api, err := New(Config{URI: server.URL})
+	require.NoError(t, err)
+	_, err = api.GetTable(context.Background(), "analytics", "events")
+	require.Error(t, err)
+	assert.EqualError(t, err, `Paimon REST API returned HTTP 409 with code 409 for TABLE "analytics.events"`)
+}
+
+func TestClientNamesOnlyIdentifiersItSentItself(t *testing.T) {
+	for name, resourceName := range map[string]string{
+		"bare token":                 "secret-token",
+		"whole header":               "Bearer secret-token",
+		"token behind a prefix":      "principal:secret-token",
+		"token split by a mark":      "Bearer\u034f secret-token",
+		"short custom header value":  "abc",
+		"unrelated identifier":       "other",
+		"identifier plus extra text": "analytics extra",
+		"substring of an identifier": "analytic",
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "DATABASE",
+				"resourceName": resourceName,
+				"code":         404,
+			})
+			defer server.Close()
+
+			api, err := New(Config{URI: server.URL, Token: "secret-token", Headers: map[string]string{"X-Custom-Secret": "abc"}})
+			require.NoError(t, err)
+			_, err = api.GetDatabase(context.Background(), "analytics")
+			require.Error(t, err)
+			assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404: DATABASE not found")
+		})
+	}
+}
+
+func TestClientNamesIdentifiersThatOverlapProtocolHeaders(t *testing.T) {
+	for _, database := range []string{"app", "terraform"} {
+		t.Run(database, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "DATABASE",
+				"resourceName": database,
+				"code":         404,
+			})
+			defer server.Close()
+
+			api, err := New(Config{URI: server.URL})
+			require.NoError(t, err)
+			_, err = api.GetDatabase(context.Background(), database)
+			require.Error(t, err)
+			assert.EqualError(t, err, `Paimon REST API returned HTTP 404 with code 404: DATABASE "`+database+`" not found`)
+		})
+	}
+}
+
+func TestClientDoesNotTreatTheServerPrefixAsAnIdentifier(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/config" {
+			writeJSON(t, w, ConfigResponse{Overrides: map[string]string{"prefix": "Bearer secret-token"}})
+
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		writeJSON(t, w, map[string]any{"resourceType": "CATALOG", "resourceName": "Bearer secret-token", "code": 404})
+	}))
+	defer server.Close()
+
+	api, err := New(Config{URI: server.URL, Token: "secret-token"})
+	require.NoError(t, err)
+	_, err = api.GetDatabase(context.Background(), "analytics")
+	require.Error(t, err)
+	assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404: CATALOG not found")
+}
+
+func TestClientDoesNotTreatDataValuesAsIdentifiers(t *testing.T) {
+	for name, tc := range map[string]struct {
+		reflected string
+		call      func(*Client) error
+	}{
+		"database option value": {"opt-secret", func(api *Client) error {
+			return api.CreateDatabase(context.Background(), "analytics", map[string]string{"s3.secret-key": "opt-secret"})
+		}},
+		"database option under an identifier-looking key": {"secret-option-value", func(api *Client) error {
+			return api.CreateDatabase(context.Background(), "analytics", map[string]string{"name": "secret-option-value"})
+		}},
+		"database option update": {"updated-secret", func(api *Client) error {
+			return api.AlterDatabase(context.Background(), "analytics", nil, map[string]string{"table": "updated-secret"})
+		}},
+		"table option value": {"tbl-secret", func(api *Client) error {
+			return api.CreateTable(context.Background(), "analytics", "events", Schema{Options: map[string]string{"principal": "tbl-secret"}})
+		}},
+		"table option change value": {"changed-secret", func(api *Client) error {
+			return api.AlterTable(context.Background(), "analytics", "events", []SchemaChange{{"action": "setOption", "key": "name", "value": "changed-secret"}})
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "DATABASE",
+				"resourceName": tc.reflected,
+				"code":         404,
+			})
+			defer server.Close()
+
+			api, err := New(Config{URI: server.URL})
+			require.NoError(t, err)
+			err = tc.call(api)
+			require.Error(t, err)
+			assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404: DATABASE not found")
+		})
+	}
+}
+
+func TestClientNamesIdentifiersFromTableBodies(t *testing.T) {
+	for name, tc := range map[string]struct {
+		reflected string
+		call      func(*Client) error
+	}{
+		"table object": {"events", func(api *Client) error {
+			return api.CreateTable(context.Background(), "analytics", "events", Schema{})
+		}},
+		"qualified table object": {"analytics.events", func(api *Client) error {
+			return api.CreateTable(context.Background(), "analytics", "events", Schema{})
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "TABLE",
+				"resourceName": tc.reflected,
+				"code":         404,
+			})
+
+			api, err := New(Config{URI: server.URL})
+			require.NoError(t, err)
+			err = tc.call(api)
+			require.Error(t, err)
+			assert.EqualError(t, err, `Paimon REST API returned HTTP 404 with code 404: TABLE "`+tc.reflected+`" not found`)
+		})
+	}
+}
+
+func TestClientDoesNotPrintColumnNamesInAnyShape(t *testing.T) {
+	// Column names can come from the server, so none of them are printed.
+	for name, call := range map[string]func(*Client) error{
+		"schema field": func(api *Client) error {
+			return api.CreateTable(context.Background(), "analytics", "events", Schema{Fields: []Field{{Name: "secret-token"}}})
+		},
+		"field nested in a map value type": func(api *Client) error {
+			return api.CreateTable(context.Background(), "analytics", "events", Schema{Fields: []Field{{Name: "attrs", Type: DataType("MAP<STRING, ROW<`secret-token` STRING>>")}}})
+		},
+		"dropped field": func(api *Client) error {
+			return api.AlterTable(context.Background(), "analytics", "events", []SchemaChange{{"action": "dropColumn", "fieldNames": []string{"secret-token"}}})
+		},
+		"renamed field": func(api *Client) error {
+			return api.AlterTable(context.Background(), "analytics", "events", []SchemaChange{{"action": "renameColumn", "fieldNames": []string{"email"}, "newName": "secret-token"}})
+		},
+		"moved field": func(api *Client) error {
+			return api.AlterTable(context.Background(), "analytics", "events", []SchemaChange{{"action": "updateColumnPosition", "move": map[string]any{"fieldName": "secret-token", "referenceFieldName": "secret-token", "type": "AFTER"}}})
+		},
+		"masked column": func(api *Client) error {
+			return api.CreatePolicy(context.Background(), "analytics", "events", PolicyRequest{Principal: "user:analyst", ColumnMask: &ColumnMask{OnColumn: "secret-token", Transform: `{"type":"null"}`}})
+		},
+		"dropped policy column": func(api *Client) error {
+			return api.DropPolicy(context.Background(), "analytics", "events", PolicyTypeColumnMasking, "user:analyst", "secret-token")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "COLUMN",
+				"resourceName": "secret-token",
+				"code":         404,
+			})
+
+			api, err := New(Config{URI: server.URL, Token: "secret-token"})
+			require.NoError(t, err)
+			err = call(api)
+			require.Error(t, err)
+			assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404: COLUMN not found")
+		})
+	}
+}
+
+func TestClientDoesNotPrintColumnListsThatMayComeFromTheServer(t *testing.T) {
+	// Column and key lists can come back from state unchanged.
+	for name, call := range map[string]func(*Client) error{
+		"permission column": func(api *Client) error {
+			return api.GrantPermission(context.Background(), PermissionAssignment{
+				Resource:  PermissionResource{Type: ResourceTypeTable, Database: "analytics", Table: "events"},
+				Access:    PermissionAccessSelect,
+				Principal: "user:analyst",
+				Columns:   &PermissionColumns{ColumnNames: []string{"secret-token"}},
+			})
+		},
+		"excluded permission column": func(api *Client) error {
+			return api.GrantPermission(context.Background(), PermissionAssignment{
+				Resource:  PermissionResource{Type: ResourceTypeTable, Database: "analytics", Table: "events"},
+				Access:    PermissionAccessSelect,
+				Principal: "user:analyst",
+				Columns:   &PermissionColumns{ExcludedColumnNames: []string{"secret-token"}},
+			})
+		},
+		"partition key": func(api *Client) error {
+			return api.CreateTable(context.Background(), "analytics", "events", Schema{PartitionKeys: []string{"secret-token"}})
+		},
+		"primary key": func(api *Client) error {
+			return api.CreateTable(context.Background(), "analytics", "events", Schema{PrimaryKeys: []string{"secret-token"}})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "COLUMN",
+				"resourceName": "secret-token",
+				"code":         404,
+			})
+
+			api, err := New(Config{URI: server.URL, Token: "secret-token"})
+			require.NoError(t, err)
+			err = call(api)
+			require.Error(t, err)
+			assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404: COLUMN not found")
+		})
+	}
+}
+
+func TestClientRejectsQualifiedNamesWithAnUnsentComponent(t *testing.T) {
+	for name, resourceName := range map[string]string{
+		"unsent suffix":  "analytics.abc",
+		"unsent prefix":  "abc.analytics",
+		"header in both": "abc.abc",
+		"three parts":    "analytics.events.abc",
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "TABLE",
+				"resourceName": resourceName,
+				"code":         404,
+			})
+
+			api, err := New(Config{URI: server.URL, Headers: map[string]string{"X-Custom-Secret": "abc"}})
+			require.NoError(t, err)
+			_, err = api.GetTable(context.Background(), "analytics", "events")
+			require.Error(t, err)
+			assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404: TABLE not found")
+		})
+	}
+}
+
+func TestClientRejectsOversizedResourceNamesBeforeScanning(t *testing.T) {
+	huge := strings.Repeat("analytics.", 25000)
+	server := errorServer(t, http.StatusNotFound, map[string]any{
+		"resourceType": "TABLE",
+		"resourceName": huge,
+		"code":         404,
+	})
+	defer server.Close()
+
+	api, err := New(Config{URI: server.URL})
+	require.NoError(t, err)
+	err = api.GrantPermission(context.Background(), PermissionAssignment{
+		Resource: PermissionResource{Type: ResourceTypeTable, Database: "analytics", Table: "events"},
+		Columns:  &PermissionColumns{ColumnNames: []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}},
+	})
+	require.Error(t, err)
+	assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404: TABLE not found")
+}
+
+func TestClientNamesQualifiedTargetsSentInTheBody(t *testing.T) {
+	for _, tc := range []struct{ database, table, qualified string }{
+		{"analytics", "events", "analytics.events"},
+		{"analytics", "events.v2", "analytics.events.v2"},
+		{"analytics.v2", "events", "analytics.v2.events"},
+	} {
+		t.Run(tc.qualified, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, map[string]any{
+				"resourceType": "TABLE",
+				"resourceName": tc.qualified,
+				"code":         404,
+			})
+			defer server.Close()
+
+			api, err := New(Config{URI: server.URL})
+			require.NoError(t, err)
+			err = api.GrantPermission(context.Background(), PermissionAssignment{
+				Resource:  PermissionResource{Type: ResourceTypeTable, Database: tc.database, Table: tc.table},
+				Access:    PermissionAccessSelect,
+				Principal: "user:analyst",
+			})
+			require.Error(t, err)
+			assert.EqualError(t, err, `Paimon REST API returned HTTP 404 with code 404: TABLE "`+tc.qualified+`" not found`)
+		})
+	}
+}
+
+func TestClientMarksConfigFailuresSeparatelyFromOperations(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		writeJSON(t, w, map[string]any{"resourceType": "CATALOG", "resourceName": "analytics", "code": 404})
+	}))
+	defer server.Close()
+
+	api, err := New(Config{URI: server.URL, Warehouse: "analytics"})
+	require.NoError(t, err)
+	err = api.GrantPermission(context.Background(), PermissionAssignment{Principal: "user:analyst"})
+	require.Error(t, err)
+	assert.True(t, IsNotFound(err))
+	assert.True(t, IsConfigurationFailure(err))
+	assert.ErrorContains(t, err, `CATALOG "analytics" not found`)
+
+	operationServer := errorServer(t, http.StatusNotFound, map[string]any{"code": 404})
+	api, err = New(Config{URI: operationServer.URL})
+	require.NoError(t, err)
+	err = api.GrantPermission(context.Background(), PermissionAssignment{Principal: "user:analyst"})
+	require.Error(t, err)
+	assert.True(t, IsNotFound(err))
+	assert.False(t, IsConfigurationFailure(err))
+}
+
+func TestClientDropsResourceTypeOutsideTheContract(t *testing.T) {
+	server := errorServer(t, http.StatusNotFound, map[string]any{
+		"resourceType": "Bearer secret-token",
+		"resourceName": "analytics",
+		"code":         404,
+	})
+	defer server.Close()
+
+	api, err := New(Config{URI: server.URL, Token: "secret-token"})
+	require.NoError(t, err)
+	_, err = api.GetDatabase(context.Background(), "analytics")
+	require.Error(t, err)
+	assert.EqualError(t, err, `Paimon REST API returned HTTP 404 with code 404: resource "analytics" not found`)
+}
+
+func TestClientOmitsResourceIdentityWithoutUsableFields(t *testing.T) {
+	for name, body := range map[string]map[string]any{
+		"null fields":    {"resourceType": nil, "resourceName": nil, "code": 404},
+		"empty fields":   {"resourceType": "", "resourceName": "", "code": 404},
+		"unknown type":   {"resourceType": "Bearer secret-token", "resourceName": "secret-token", "code": 404},
+		"no such fields": {"code": 404},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := errorServer(t, http.StatusNotFound, body)
+			defer server.Close()
+
+			api, err := New(Config{URI: server.URL, Token: "secret-token"})
+			require.NoError(t, err)
+			_, err = api.GetDatabase(context.Background(), "analytics")
+			require.Error(t, err)
+			assert.EqualError(t, err, "Paimon REST API returned HTTP 404 with code 404")
+		})
+	}
+}
+
 func TestClientRetriesRetryableReads(t *testing.T) {
 	var configCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
