@@ -20,6 +20,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 
@@ -202,7 +203,7 @@ func (r *rowFilterResource) Create(ctx context.Context, req resource.CreateReque
 	}
 	result := createPolicyWithReconciliation(ctx, r.client, rowFilterSpec(plan), false)
 	if !result.accepted {
-		resp.Diagnostics.AddError("Unable to create Paimon row filter", result.err.Error())
+		resp.Diagnostics.AddError("Unable to create Paimon row filter", explainNotFound(result.err.Error(), result.cause, rowFilterReferences))
 
 		return
 	}
@@ -281,7 +282,7 @@ func (r *rowFilterResource) Update(ctx context.Context, req resource.UpdateReque
 		resp.Diagnostics.AddWarning("Recovered Paimon row-filter replacement", result.warning)
 	}
 	if result.err != nil {
-		resp.Diagnostics.AddError("Unable to replace Paimon row filter", result.err.Error())
+		resp.Diagnostics.AddError("Unable to replace Paimon row filter", explainNotFound(result.err.Error(), result.cause, rowFilterReferences))
 	}
 }
 
@@ -392,7 +393,7 @@ func (r *columnMaskResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 	result := createPolicyWithReconciliation(ctx, r.client, columnMaskSpec(plan), false)
 	if !result.accepted {
-		resp.Diagnostics.AddError("Unable to create Paimon column mask", result.err.Error())
+		resp.Diagnostics.AddError("Unable to create Paimon column mask", explainNotFound(result.err.Error(), result.cause, columnMaskReferences))
 
 		return
 	}
@@ -471,7 +472,7 @@ func (r *columnMaskResource) Update(ctx context.Context, req resource.UpdateRequ
 		resp.Diagnostics.AddWarning("Recovered Paimon column-mask replacement", result.warning)
 	}
 	if result.err != nil {
-		resp.Diagnostics.AddError("Unable to replace Paimon column mask", result.err.Error())
+		resp.Diagnostics.AddError("Unable to replace Paimon column mask", explainNotFound(result.err.Error(), result.cause, columnMaskReferences))
 	}
 }
 
@@ -623,12 +624,14 @@ type policyCreateResult struct {
 	observed *client.DataPolicy
 	warning  string
 	err      error
+	// cause is the raw REST error behind err.
+	cause error
 }
 
 func createPolicyWithReconciliation(ctx context.Context, api *client.Client, spec policySpec, alreadyManaged bool) policyCreateResult {
 	createErr := api.CreatePolicy(ctx, spec.database, spec.table, spec.request)
 	if createErr != nil && !alreadyManaged && !client.IsMutationOutcomeUncertain(createErr) {
-		return policyCreateResult{err: fmt.Errorf("creating the %s was rejected: %w. Import an existing policy explicitly; it has not been adopted into state", spec.label, createErr)}
+		return policyCreateResult{cause: createErr, err: fmt.Errorf("creating the %s was rejected: %w. Import an existing policy explicitly; it has not been adopted into state", spec.label, createErr)}
 	}
 	recoveryCtx, cancel := mutationRecoveryContext(ctx, api)
 	defer cancel()
@@ -658,13 +661,13 @@ func createPolicyWithReconciliation(ctx context.Context, api *client.Client, spe
 		return result
 	}
 	if reconcileErr != nil {
-		return policyCreateResult{err: fmt.Errorf("creating the %s failed (%s), and bounded reconciliation could not establish the remote state: %w", spec.label, createErr, reconcileErr)}
+		return policyCreateResult{cause: createErr, err: fmt.Errorf("creating the %s failed (%s), and bounded reconciliation could not establish the remote state: %w", spec.label, createErr, reconcileErr)}
 	}
 	if !found {
-		return policyCreateResult{err: fmt.Errorf("creating the %s failed, and bounded reconciliation confirmed that the policy is absent: %w", spec.label, createErr)}
+		return policyCreateResult{cause: createErr, err: fmt.Errorf("creating the %s failed, and bounded reconciliation confirmed that the policy is absent: %w", spec.label, createErr)}
 	}
 	if !converged {
-		return policyCreateResult{observed: &observed, err: fmt.Errorf("creating the %s failed (%s), and the same identity exists with different policy content", spec.label, createErr)}
+		return policyCreateResult{cause: createErr, observed: &observed, err: fmt.Errorf("creating the %s failed (%s), and the same identity exists with different policy content", spec.label, createErr)}
 	}
 
 	return policyCreateResult{
@@ -679,6 +682,7 @@ type policyReplacementResult struct {
 	observed *client.DataPolicy
 	warning  string
 	err      error
+	cause    error
 }
 
 type policyLookupObservation struct {
@@ -732,13 +736,13 @@ func replacePolicyWithReconciliation(ctx context.Context, api *client.Client, pr
 	if created.observed != nil {
 		matches, err := previous.matchesWithSchema(ctx, api, *created.observed)
 		if err != nil {
-			return policyReplacementResult{observed: created.observed, err: err}
+			return policyReplacementResult{cause: created.cause, observed: created.observed, err: fmt.Errorf("creating the replacement failed (%s), and comparing the remaining policy failed: %w", created.err, err)}
 		}
 		if matches {
-			return policyReplacementResult{observed: created.observed, err: fmt.Errorf("creating the replacement failed, but reconciliation confirmed that the previous %s remains attached: %w", previous.label, created.err)}
+			return policyReplacementResult{cause: created.cause, observed: created.observed, err: fmt.Errorf("creating the replacement failed, but reconciliation confirmed that the previous %s remains attached: %w", previous.label, created.err)}
 		}
 
-		return policyReplacementResult{observed: created.observed, err: fmt.Errorf("creating the replacement failed, and reconciliation found unexpected policy content for the same identity: %w", created.err)}
+		return policyReplacementResult{cause: created.cause, observed: created.observed, err: fmt.Errorf("creating the replacement failed, and reconciliation found unexpected policy content for the same identity: %w", created.err)}
 	}
 
 	recoveryCtx, cancel := mutationRecoveryContext(ctx, api)
@@ -750,14 +754,14 @@ func replacePolicyWithReconciliation(ctx context.Context, api *client.Client, pr
 			detail += fmt.Sprintf(", but verification of the restored policy also failed (%s)", restored.err)
 		}
 
-		return policyReplacementResult{observed: restored.observed, err: fmt.Errorf("%s", detail)}
+		return policyReplacementResult{cause: created.cause, observed: restored.observed, err: errors.New(detail)}
 	}
 	restoredDesired := false
 	if restored.observed != nil {
 		var err error
 		restoredDesired, err = desired.matchesWithSchema(recoveryCtx, api, *restored.observed)
 		if err != nil {
-			return policyReplacementResult{observed: restored.observed, err: err}
+			return policyReplacementResult{cause: notFoundCause(created.cause, restored.cause), observed: restored.observed, err: fmt.Errorf("creating the replacement failed (%s), restoring the previous %s failed (%s), and comparing the remaining policy failed: %w", created.err, previous.label, restored.err, err)}
 		}
 	}
 	if restoredDesired {
@@ -768,7 +772,16 @@ func replacePolicyWithReconciliation(ctx context.Context, api *client.Client, pr
 		}
 	}
 
-	return policyReplacementResult{err: fmt.Errorf("creating the replacement failed (%s), and restoring the previous %s also failed (%s). The principal may currently have no %s", created.err, previous.label, restored.err, previous.label)}
+	return policyReplacementResult{cause: notFoundCause(created.cause, restored.cause), err: fmt.Errorf("creating the replacement failed (%s), and restoring the previous %s also failed (%s). The principal may currently have no %s", created.err, previous.label, restored.err, previous.label)}
+}
+
+// notFoundCause picks the write that was refused with HTTP 404, if either was.
+func notFoundCause(first, second error) error {
+	if !explainableNotFound(first) && explainableNotFound(second) {
+		return second
+	}
+
+	return first
 }
 
 func validateSerializedPolicy(name, value string, diags *diag.Diagnostics) {

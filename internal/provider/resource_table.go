@@ -467,18 +467,9 @@ func tableMatchesPlannedSchema(table *client.Table, expected client.Schema, comp
 }
 
 func setTableResourceModel(ctx context.Context, model *tableResourceModel, table *client.Table, diags *diag.Diagnostics) {
-	database := table.Database
-	if database == "" {
-		database = model.Database.ValueString()
-	}
-	name := table.Name
-	if name == "" {
-		name = model.Name.ValueString()
-	}
-	model.ID = types.StringValue(tableID(database, name))
+	// Identity comes from the caller, never from the response.
+	model.ID = types.StringValue(tableID(model.Database.ValueString(), model.Name.ValueString()))
 	model.ServerID = types.StringValue(table.ID)
-	model.Database = types.StringValue(database)
-	model.Name = types.StringValue(name)
 	model.Fields = resourceFieldsValueFromRemote(ctx, model.Fields, table.Schema.Fields, diags)
 	model.PartitionKeys = stringListValue(ctx, table.Schema.PartitionKeys, diags)
 	model.PrimaryKeys = stringListValue(ctx, table.Schema.PrimaryKeys, diags)

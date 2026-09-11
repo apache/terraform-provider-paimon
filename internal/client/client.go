@@ -78,6 +78,8 @@ type APIError struct {
 	ResourceType *string `json:"resourceType"`
 	ResourceName *string `json:"resourceName"`
 	RequestID    string  `json:"-"`
+	// LoadingConfig: the catalog config request failed, not the operation.
+	LoadingConfig bool `json:"-"`
 }
 
 func (e *APIError) Error() string {
@@ -88,8 +90,140 @@ func (e *APIError) Error() string {
 	if e.RequestID != "" {
 		detail += " (request ID " + e.RequestID + ")"
 	}
+	if subject := e.resourceSubject(); subject != "" {
+		if e.StatusCode == http.StatusNotFound {
+			detail += ": " + subject + " not found"
+		} else {
+			detail += " for " + subject
+		}
+	}
 
 	return detail
+}
+
+// resourceSubject renders e.g. `USER "analyst"`; never the free-text message.
+func (e *APIError) resourceSubject() string {
+	kind := "resource"
+	if e.ResourceType != nil {
+		kind = *e.ResourceType
+	}
+	switch {
+	case e.ResourceName != nil:
+		return kind + " " + strconv.Quote(*e.ResourceName)
+	case e.ResourceType != nil:
+		return kind
+	default:
+		return ""
+	}
+}
+
+// resourceTypes is the allowlist of kinds worth naming: Paimon's
+// ErrorResponse kinds plus the principal kinds access-controlled servers use.
+var resourceTypes = map[string]struct{}{
+	"catalog": {}, "database": {}, "table": {}, "view": {}, "function": {}, "column": {},
+	"partition": {}, "snapshot": {}, "branch": {}, "tag": {}, "dialect": {}, "definition": {},
+	"policy": {}, "permission": {}, "user": {}, "role": {}, "principal": {},
+}
+
+func safeResourceType(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	if _, ok := resourceTypes[strings.ToLower(*value)]; !ok {
+		return nil
+	}
+
+	return value
+}
+
+// safeResourceName keeps a resourceName only if the client sent it as an
+// identifier (or two joined by a dot), so a server cannot echo arbitrary text.
+func safeResourceName(sent map[string]struct{}, value *string) *string {
+	if value == nil {
+		return nil
+	}
+	longest := 0
+	for identifier := range sent {
+		longest = max(longest, len(identifier))
+	}
+	name := *value
+	if len(name) > 2*longest+1 {
+		return nil
+	}
+	if _, ok := sent[name]; ok {
+		return value
+	}
+	for head := range sent {
+		if len(name) > len(head)+1 && name[len(head)] == '.' && name[:len(head)] == head {
+			if _, ok := sent[name[len(head)+1:]]; ok {
+				return value
+			}
+		}
+	}
+
+	return nil
+}
+
+// identityKeys name catalog objects and principals, which configuration
+// pins; column names are left out because they can come from the server via
+// state or data sources. dataKeys are subtrees that are never entered.
+var (
+	identityKeys = map[string]struct{}{
+		"warehouse": {}, "name": {}, "database": {}, "table": {}, "object": {}, "function": {},
+		"view": {}, "principal": {},
+	}
+	dataKeys = map[string]struct{}{
+		"schema": {}, "changes": {}, "columns": {}, "rowFilter": {}, "columnMask": {},
+		"options": {}, "updates": {}, "removals": {}, "comment": {}, "description": {},
+	}
+)
+
+// requestIdentifiers collects what the request named: path segments after the
+// server-provided prefix, plus query and body values under identityKeys.
+func requestIdentifiers(segments []string, query url.Values, body []byte) map[string]struct{} {
+	sent := make(map[string]struct{})
+	if len(segments) > 2 {
+		for _, segment := range segments[2:] {
+			sent[segment] = struct{}{}
+		}
+	}
+	for key, values := range query {
+		if _, ok := identityKeys[key]; !ok {
+			continue
+		}
+		for _, value := range values {
+			sent[value] = struct{}{}
+		}
+	}
+	if len(body) > 0 {
+		var decoded any
+		if err := json.Unmarshal(body, &decoded); err == nil {
+			collectIdentifiers(decoded, "", sent)
+		}
+	}
+	delete(sent, "")
+
+	return sent
+}
+
+func collectIdentifiers(value any, key string, into map[string]struct{}) {
+	if _, data := dataKeys[key]; data {
+		return
+	}
+	switch typed := value.(type) {
+	case string:
+		if _, ok := identityKeys[key]; ok {
+			into[typed] = struct{}{}
+		}
+	case []any:
+		for _, element := range typed {
+			collectIdentifiers(element, key, into)
+		}
+	case map[string]any:
+		for childKey, element := range typed {
+			collectIdentifiers(element, childKey, into)
+		}
+	}
 }
 
 var requestIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -122,6 +256,13 @@ func IsNotFound(err error) bool {
 	var apiErr *APIError
 
 	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+}
+
+// IsConfigurationFailure reports whether err came from loading the config.
+func IsConfigurationFailure(err error) bool {
+	var apiErr *APIError
+
+	return errors.As(err, &apiErr) && apiErr.LoadingConfig
 }
 
 // IsMutationOutcomeUncertain reports whether a failed mutation may have been
@@ -299,6 +440,11 @@ func (c *Client) ensureConfigured(ctx context.Context) error {
 
 	var response ConfigResponse
 	if err := c.doRaw(ctx, http.MethodGet, []string{"v1", "config"}, query, nil, &response, c.headers); err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) {
+			apiErr.LoadingConfig = true
+		}
+
 		return fmt.Errorf("load Paimon REST catalog config: %w", err)
 	}
 
@@ -404,6 +550,8 @@ func (c *Client) doRaw(ctx context.Context, method string, segments []string, qu
 		if err := json.NewDecoder(limited).Decode(apiErr); err != nil && err != io.EOF {
 			apiErr.Message = http.StatusText(response.StatusCode)
 		}
+		apiErr.ResourceType = safeResourceType(apiErr.ResourceType)
+		apiErr.ResourceName = safeResourceName(requestIdentifiers(segments, query, requestBody), apiErr.ResourceName)
 
 		return apiErr
 	}

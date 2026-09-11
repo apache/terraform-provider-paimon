@@ -57,7 +57,7 @@ func TestDatabaseFailedOptionRemovalRetainsManagement(t *testing.T) {
 	var sr resource.SchemaResponse
 	res.Schema(ctx, resource.SchemaRequest{}, &sr)
 	var ds diag.Diagnostics
-	model := databaseResourceModel{Options: types.MapValueMust(types.StringType, map[string]attr.Value{"owner": types.StringValue("old")})}
+	model := databaseResourceModel{Name: types.StringValue("analytics"), Options: types.MapValueMust(types.StringType, map[string]attr.Value{"owner": types.StringValue("old")})}
 	setDatabaseResourceModel(ctx, &model, remote, &ds)
 	require.False(t, ds.HasError(), ds)
 	state := tfsdk.State{Schema: sr.Schema}
@@ -98,7 +98,7 @@ func TestTableFailedOptionRemovalRetainsManagement(t *testing.T) {
 	var sr resource.SchemaResponse
 	res.Schema(ctx, resource.SchemaRequest{}, &sr)
 	var ds diag.Diagnostics
-	model := tableResourceModel{Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapValueMust(types.StringType, map[string]attr.Value{"retention": types.StringValue("old")})}
+	model := tableResourceModel{Database: types.StringValue("analytics"), Name: types.StringValue("events"), Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapValueMust(types.StringType, map[string]attr.Value{"retention": types.StringValue("old")})}
 	setTableResourceModel(ctx, &model, remote, &ds)
 	require.False(t, ds.HasError(), ds)
 	state := tfsdk.State{Schema: sr.Schema}
@@ -134,7 +134,7 @@ func TestImportedImmutableOptionCanBecomeManaged(t *testing.T) {
 	ctx := context.Background()
 	remote := &client.Table{Database: "analytics", Name: "events", Schema: client.Schema{Fields: []client.Field{{ID: 0, Name: "id", Type: "BIGINT"}}, Options: map[string]string{"merge-engine": "partial-update"}}}
 	var ds diag.Diagnostics
-	imported := tableResourceModel{Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapNull(types.StringType)}
+	imported := tableResourceModel{Database: types.StringValue("analytics"), Name: types.StringValue("events"), Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapNull(types.StringType)}
 	setTableResourceModel(ctx, &imported, remote, &ds)
 	require.False(t, ds.HasError(), ds)
 	require.True(t, imported.Options.IsNull())
@@ -261,7 +261,7 @@ func TestTableUpdateRejectsResolvedNewFieldIDBeforeMutation(t *testing.T) {
 	ctx := context.Background()
 	var diags diag.Diagnostics
 	remote := &client.Table{Database: "analytics", Name: "events", Schema: client.Schema{Fields: []client.Field{{ID: 0, Name: "id", Type: "BIGINT"}}}}
-	model := tableResourceModel{Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapNull(types.StringType)}
+	model := tableResourceModel{Database: types.StringValue("analytics"), Name: types.StringValue("events"), Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapNull(types.StringType)}
 	setTableResourceModel(ctx, &model, remote, &diags)
 	require.False(t, diags.HasError(), diags)
 	res := &tableResource{} // No client: validation must finish before any REST call.
@@ -297,7 +297,7 @@ func TestTableReplacementRequiresOptIn(t *testing.T) {
 				var sr resource.SchemaResponse
 				res.Schema(ctx, resource.SchemaRequest{}, &sr)
 				var diags diag.Diagnostics
-				before := tableResourceModel{Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapNull(types.StringType)}
+				before := tableResourceModel{Database: types.StringValue("analytics"), Name: types.StringValue("events"), Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapNull(types.StringType)}
 				remote := &client.Table{Database: "analytics", Name: "events", Schema: client.Schema{Fields: []client.Field{{ID: 0, Name: "id", Type: "BIGINT NOT NULL"}}}}
 				setTableResourceModel(ctx, &before, remote, &diags)
 				require.False(t, diags.HasError(), diags)
@@ -360,7 +360,7 @@ func TestDatabaseSuccessfulButStaleRemovalRetainsManagement(t *testing.T) {
 	var sr resource.SchemaResponse
 	res.Schema(ctx, resource.SchemaRequest{}, &sr)
 	var ds diag.Diagnostics
-	model := databaseResourceModel{Options: types.MapValueMust(types.StringType, map[string]attr.Value{"owner": types.StringValue("old")})}
+	model := databaseResourceModel{Name: types.StringValue("analytics"), Options: types.MapValueMust(types.StringType, map[string]attr.Value{"owner": types.StringValue("old")})}
 	setDatabaseResourceModel(ctx, &model, remote, &ds)
 	require.False(t, ds.HasError(), ds)
 	state := tfsdk.State{Schema: sr.Schema}
@@ -414,7 +414,7 @@ func TestTableSuccessfulButStaleRemovalRetainsManagement(t *testing.T) {
 	var sr resource.SchemaResponse
 	res.Schema(ctx, resource.SchemaRequest{}, &sr)
 	var ds diag.Diagnostics
-	model := tableResourceModel{Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapValueMust(types.StringType, map[string]attr.Value{"retention": types.StringValue("old")})}
+	model := tableResourceModel{Database: types.StringValue("analytics"), Name: types.StringValue("events"), Fields: types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), Options: types.MapValueMust(types.StringType, map[string]attr.Value{"retention": types.StringValue("old")})}
 	setTableResourceModel(ctx, &model, remote, &ds)
 	require.False(t, ds.HasError(), ds)
 	state := tfsdk.State{Schema: sr.Schema}

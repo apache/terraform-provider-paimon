@@ -270,9 +270,9 @@ func databaseMatchesOptions(database *client.Database, name string, options map[
 }
 
 func setDatabaseResourceModel(ctx context.Context, model *databaseResourceModel, database *client.Database, diags *diag.Diagnostics) {
-	model.ID = types.StringValue(database.Name)
+	// Identity comes from the caller, never from the response.
+	model.ID = types.StringValue(model.Name.ValueString())
 	model.ServerID = types.StringValue(database.ID)
-	model.Name = types.StringValue(database.Name)
 	model.Options = syncManagedOptions(ctx, model.Options, database.Options, diags)
 	model.ServerOptions = stringMapValue(ctx, database.Options, diags)
 	model.Location = types.StringValue(database.Location)
