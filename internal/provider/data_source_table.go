@@ -83,18 +83,9 @@ func (d *tableDataSource) Read(ctx context.Context, req datasource.ReadRequest, 
 
 		return
 	}
-	database := table.Database
-	if database == "" {
-		database = data.Database.ValueString()
-	}
-	name := table.Name
-	if name == "" {
-		name = data.Name.ValueString()
-	}
-	data.ID = types.StringValue(tableID(database, name))
+	// Identity comes from the caller, never from the response.
+	data.ID = types.StringValue(tableID(data.Database.ValueString(), data.Name.ValueString()))
 	data.ServerID = types.StringValue(table.ID)
-	data.Database = types.StringValue(database)
-	data.Name = types.StringValue(name)
 	data.Fields = fieldsValueFromRemote(ctx, table.Schema.Fields, &resp.Diagnostics)
 	data.PartitionKeys = stringListValue(ctx, table.Schema.PartitionKeys, &resp.Diagnostics)
 	data.PrimaryKeys = stringListValue(ctx, table.Schema.PrimaryKeys, &resp.Diagnostics)

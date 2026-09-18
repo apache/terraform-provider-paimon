@@ -30,6 +30,7 @@ import (
 
 	"github.com/apache/terraform-provider-paimon/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	resourceschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -634,6 +635,671 @@ func TestPermissionCreateRetainsStateWhenReconciliationFails(t *testing.T) {
 	assert.Equal(t, permissionID(planModel), retained.ID.ValueString())
 	assert.Equal(t, "2027-01-01t00:00:00.123000z", retained.ExpireTime.ValueString())
 	assert.GreaterOrEqual(t, listCalls, 3)
+}
+
+// unknownPrincipalServer refuses every write with an unknown-principal 404.
+func unknownPrincipalServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+		case request.Method == http.MethodPost:
+			w.WriteHeader(http.StatusNotFound)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"resourceType": "USER",
+				"resourceName": "role:analyst",
+				"message":      "User role:analyst does not exist.",
+				"code":         404,
+			}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/permissions":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ListPermissionsResponse{}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ListPoliciesResponse{}))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+}
+
+func TestPermissionCreateExplainsUnknownPrincipal(t *testing.T) {
+	ctx := context.Background()
+	server := unknownPrincipalServer(t)
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &permissionResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	planModel := permissionResourceModel{
+		ID:                  types.StringUnknown(),
+		ResourceType:        types.StringValue(client.ResourceTypeTable),
+		Database:            types.StringValue("analytics"),
+		Table:               types.StringValue("events"),
+		Function:            types.StringNull(),
+		View:                types.StringNull(),
+		Access:              types.StringValue(client.PermissionAccessSelect),
+		Principal:           types.StringValue("role:analyst"),
+		ColumnNames:         types.SetNull(types.StringType),
+		ExcludedColumnNames: types.SetNull(types.StringType),
+		ExpireTime:          types.StringNull(),
+	}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Create(ctx, resource.CreateRequest{Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal or the catalog, database, table, function, view, or columns the permission targets")
+	assert.NotContains(t, detail, "does not exist")
+}
+
+func TestRowFilterCreateExplainsUnknownPrincipal(t *testing.T) {
+	ctx := context.Background()
+	server := unknownPrincipalServer(t)
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &rowFilterResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	planModel := rowFilterResourceModel{
+		ID:        types.StringUnknown(),
+		Database:  types.StringValue("analytics"),
+		Table:     types.StringValue("events"),
+		Principal: types.StringValue("role:analyst"),
+		Predicate: types.StringValue(`{"field":"tenant_id"}`),
+	}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Create(ctx, resource.CreateRequest{Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal or the table the row filter targets")
+}
+
+func TestColumnMaskCreateExplainsUnknownPrincipal(t *testing.T) {
+	ctx := context.Background()
+	server := unknownPrincipalServer(t)
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &columnMaskResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	planModel := columnMaskResourceModel{
+		AllowNonAtomicUpdate: types.BoolValue(true),
+		ID:                   types.StringUnknown(),
+		Database:             types.StringValue("analytics"),
+		Table:                types.StringValue("events"),
+		Principal:            types.StringValue("role:analyst"),
+		Column:               types.StringValue("email"),
+		Transform:            types.StringValue(`{"type":"null"}`),
+	}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Create(ctx, resource.CreateRequest{Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal, the table, or the column the column mask targets")
+}
+
+func TestRowFilterUpdateExplainsUnknownPrincipalWhenRestoreSucceeds(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	remote := []client.DataPolicy{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies/drop":
+			remote = nil
+			w.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			var body client.PolicyRequest
+			require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+			if body.RowFilter.Predicate == `{"version":"new"}` {
+				w.WriteHeader(http.StatusNotFound)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+					"resourceType": "USER", "resourceName": "role:analyst", "code": 404,
+				}))
+
+				return
+			}
+			remote = []client.DataPolicy{{
+				Resource:  client.PermissionResource{Type: client.ResourceTypeTable, Database: "analytics", Table: "events"},
+				RowFilter: body.RowFilter,
+				Principal: body.Principal,
+			}}
+			w.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ListPoliciesResponse{Policies: remote}))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	detail := updateRowFilterPredicate(ctx, t, server.URL)
+	assert.Contains(t, detail, "previous row filter was restored")
+	assert.NotContains(t, detail, "verification of the restored policy also failed")
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal or the table the row filter targets")
+}
+
+func TestRowFilterUpdateExplainsUnknownPrincipalWhenRestoreFails(t *testing.T) {
+	ctx := context.Background()
+	server := unknownPrincipalServer(t)
+	defer server.Close()
+
+	detail := updateRowFilterPredicate(ctx, t, server.URL)
+	assert.Contains(t, detail, "restoring the previous row filter also failed")
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal or the table the row filter targets")
+}
+
+func TestRowFilterUpdateExplainsUnknownPrincipalWhenOnlyRestoreIs404(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies/drop":
+			w.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			var body client.PolicyRequest
+			require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+			if body.RowFilter.Predicate == `{"version":"new"}` {
+				w.WriteHeader(http.StatusBadRequest)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"code": 400}))
+
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"resourceType": "USER", "resourceName": "role:analyst", "code": 404,
+			}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ListPoliciesResponse{}))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	detail := updateRowFilterPredicate(ctx, t, server.URL)
+	assert.Contains(t, detail, "restoring the previous row filter also failed")
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal or the table the row filter targets")
+}
+
+func TestRowFilterUpdateExplainsUnknownPrincipalAfterConfigOutage(t *testing.T) {
+	// Config fails during the replacement and recovers before the restore.
+	ctx := context.Background()
+	var mu sync.Mutex
+	configCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			configCalls++
+			if configCalls <= 2 {
+				w.WriteHeader(http.StatusNotFound)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"code": 404}))
+
+				return
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			w.WriteHeader(http.StatusNotFound)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"resourceType": "USER", "resourceName": "role:analyst", "code": 404,
+			}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ListPoliciesResponse{}))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	detail := updateRowFilterPredicate(ctx, t, server.URL)
+	assert.Contains(t, detail, "restoring the previous row filter also failed")
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal or the table the row filter targets")
+}
+
+func TestColumnMaskUpdateExplainsUnknownPrincipal(t *testing.T) {
+	ctx := context.Background()
+	server := unknownPrincipalServer(t)
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &columnMaskResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	stateModel := columnMaskResourceModel{
+		AllowNonAtomicUpdate: types.BoolValue(true),
+		ID:                   types.StringValue("column=email&database=analytics&principal=role%3Aanalyst&table=events"),
+		Database:             types.StringValue("analytics"),
+		Table:                types.StringValue("events"),
+		Principal:            types.StringValue("role:analyst"),
+		Column:               types.StringValue("email"),
+		Transform:            types.StringValue(`{"type":"null"}`),
+	}
+	planModel := stateModel
+	planModel.Transform = types.StringValue(`{"type":"hash"}`)
+	state := tfsdk.State{Schema: schemaResponse.Schema}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, state.Set(ctx, &stateModel).HasError())
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.UpdateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Update(ctx, resource.UpdateRequest{State: state, Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal, the table, or the column the column mask targets")
+}
+
+// updateRowFilterPredicate runs a row-filter Update and returns the error detail.
+func updateRowFilterPredicate(ctx context.Context, t *testing.T, uri string) string {
+	t.Helper()
+	api, err := client.New(client.Config{URI: uri, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &rowFilterResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	stateModel := rowFilterResourceModel{
+		AllowNonAtomicUpdate: types.BoolValue(true),
+		ID:                   types.StringValue("database=analytics&principal=role%3Aanalyst&table=events"),
+		Database:             types.StringValue("analytics"),
+		Table:                types.StringValue("events"),
+		Principal:            types.StringValue("role:analyst"),
+		Predicate:            types.StringValue(`{"version":"old"}`),
+	}
+	planModel := stateModel
+	planModel.Predicate = types.StringValue(`{"version":"new"}`)
+	state := tfsdk.State{Schema: schemaResponse.Schema}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, state.Set(ctx, &stateModel).HasError())
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.UpdateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Update(ctx, resource.UpdateRequest{State: state, Plan: plan}, &response)
+	require.True(t, response.Diagnostics.HasError())
+
+	return response.Diagnostics.Errors()[0].Detail()
+}
+
+func TestRowFilterCreateDoesNotBlameThePrincipalWhenConfigFails(t *testing.T) {
+	ctx := context.Background()
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if request.Method == http.MethodPost {
+			posts++
+		}
+		w.WriteHeader(http.StatusNotFound)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"resourceType": "CATALOG", "resourceName": "analytics", "code": 404}))
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, Warehouse: "analytics", RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &rowFilterResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	planModel := rowFilterResourceModel{
+		ID:        types.StringUnknown(),
+		Database:  types.StringValue("analytics"),
+		Table:     types.StringValue("events"),
+		Principal: types.StringValue("role:analyst"),
+		Predicate: types.StringValue(`{"field":"tenant_id"}`),
+	}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Create(ctx, resource.CreateRequest{Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, `CATALOG "analytics" not found`)
+	assert.NotContains(t, detail, "could not find the principal")
+	assert.Equal(t, 0, posts)
+}
+
+func TestRowFilterCreateHintMentionsUnsupportedManagementAPI(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/v1/config" {
+			w.Header().Set("Content-Type", "application/json")
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &rowFilterResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	planModel := rowFilterResourceModel{
+		ID:        types.StringUnknown(),
+		Database:  types.StringValue("analytics"),
+		Table:     types.StringValue("events"),
+		Principal: types.StringValue("role:analyst"),
+		Predicate: types.StringValue(`{"field":"tenant_id"}`),
+	}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Create(ctx, resource.CreateRequest{Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, "usually means it could not find the principal or the table the row filter targets")
+	assert.Contains(t, detail, "does not serve this management API")
+}
+
+func TestDatabaseReadKeepsTheRequestedName(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics":
+			require.NoError(t, json.NewEncoder(w).Encode(client.Database{ID: "db-1", Name: "secret-token", Location: "oss://bucket/analytics"}))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL})
+	require.NoError(t, err)
+	managed := &databaseResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	stateModel := databaseResourceModel{
+		ID:            types.StringValue("analytics"),
+		ServerID:      types.StringValue("db-1"),
+		Name:          types.StringValue("analytics"),
+		Options:       types.MapNull(types.StringType),
+		ServerOptions: types.MapNull(types.StringType),
+		Location:      types.StringValue("oss://bucket/analytics"),
+		Owner:         types.StringNull(),
+		CreatedAt:     types.Int64Null(),
+		CreatedBy:     types.StringNull(),
+		UpdatedAt:     types.Int64Null(),
+		UpdatedBy:     types.StringNull(),
+	}
+	state := tfsdk.State{Schema: schemaResponse.Schema}
+	require.False(t, state.Set(ctx, &stateModel).HasError())
+	response := resource.ReadResponse{State: state}
+	managed.Read(ctx, resource.ReadRequest{State: state}, &response)
+
+	require.False(t, response.Diagnostics.HasError(), response.Diagnostics.Errors())
+	var refreshed databaseResourceModel
+	require.False(t, response.State.Get(ctx, &refreshed).HasError())
+	assert.Equal(t, "analytics", refreshed.Name.ValueString())
+	assert.Equal(t, "analytics", refreshed.ID.ValueString())
+}
+
+func TestRowFilterUpdateExplainsUnknownPrincipalWhenComparisonFails(t *testing.T) {
+	// Comparing the leftover policy needs the schema, which stops being served.
+	ctx := context.Background()
+	var mu sync.Mutex
+	tableCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies/drop":
+			w.WriteHeader(http.StatusOK)
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			w.WriteHeader(http.StatusNotFound)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"resourceType": "USER", "resourceName": "role:analyst", "code": 404,
+			}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ListPoliciesResponse{Policies: []client.DataPolicy{{
+				Resource:  client.PermissionResource{Type: client.ResourceTypeTable, Database: "analytics", Table: "events"},
+				RowFilter: &client.RowFilter{Predicate: `{"version":"other"}`},
+				Principal: "role:analyst",
+			}}}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events":
+			tableCalls++
+			if tableCalls > 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"code": 500}))
+
+				return
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(client.Table{Database: "analytics", Name: "events", Schema: client.Schema{Fields: []client.Field{{ID: 0, Name: "region", Type: client.DataType("STRING")}}}}))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &rowFilterResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	stateModel := rowFilterResourceModel{
+		AllowNonAtomicUpdate: types.BoolValue(true),
+		ID:                   types.StringValue("database=analytics&principal=role%3Aanalyst&table=events"),
+		Database:             types.StringValue("analytics"),
+		Table:                types.StringValue("events"),
+		Principal:            types.StringValue("role:analyst"),
+		Predicate:            types.StringValue(`{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"name":"region"}}}`),
+	}
+	planModel := stateModel
+	planModel.Predicate = types.StringValue(`{"version":"new"}`)
+	state := tfsdk.State{Schema: schemaResponse.Schema}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, state.Set(ctx, &stateModel).HasError())
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.UpdateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Update(ctx, resource.UpdateRequest{State: state, Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, "comparing the remaining policy failed")
+	assert.Contains(t, detail, `USER "role:analyst" not found`)
+	assert.Contains(t, detail, "could not find the principal or the table the row filter targets")
+}
+
+func TestTableReadKeepsTheRequestedIdentity(t *testing.T) {
+	ctx := context.Background()
+	legit := &client.Table{ID: "tbl-1", Database: "analytics", Name: "events", Schema: client.Schema{Fields: []client.Field{{ID: 0, Name: "id", Type: client.DataType("BIGINT")}}}}
+	poisoned := *legit
+	poisoned.Database, poisoned.Name = "secret-token", "secret-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			writeProviderJSON(t, w, client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}})
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events":
+			writeProviderJSON(t, w, poisoned)
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL})
+	require.NoError(t, err)
+	managed := &tableResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	var ds diag.Diagnostics
+	model := tableResourceModel{
+		Database: types.StringValue("analytics"),
+		Name:     types.StringValue("events"),
+		Fields:   types.ListNull(types.ObjectType{AttrTypes: tableFieldAttrTypes()}),
+		Options:  types.MapValueMust(types.StringType, map[string]attr.Value{}),
+	}
+	setTableResourceModel(ctx, &model, legit, &ds)
+	require.False(t, ds.HasError(), ds)
+	state := tfsdk.State{Schema: schemaResponse.Schema}
+	require.False(t, state.Set(ctx, &model).HasError())
+	read := resource.ReadResponse{State: state}
+	managed.Read(ctx, resource.ReadRequest{State: state}, &read)
+
+	require.False(t, read.Diagnostics.HasError(), read.Diagnostics)
+	var after tableResourceModel
+	require.False(t, read.State.Get(ctx, &after).HasError())
+	assert.Equal(t, "analytics", after.Database.ValueString())
+	assert.Equal(t, "events", after.Name.ValueString())
+	assert.Equal(t, tableID("analytics", "events"), after.ID.ValueString())
+}
+
+func TestDatabaseDataSourceKeepsTheConfiguredName(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			writeProviderJSON(t, w, client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}})
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics":
+			writeProviderJSON(t, w, client.Database{ID: "db-1", Name: "secret-token"})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL})
+	require.NoError(t, err)
+	source := &databaseDataSource{client: api}
+	var schemaResponse datasource.SchemaResponse
+	source.Schema(ctx, datasource.SchemaRequest{}, &schemaResponse)
+	config := tfsdk.State{Schema: schemaResponse.Schema}
+	require.False(t, config.Set(ctx, &databaseDataSourceModel{
+		ID: types.StringUnknown(), ServerID: types.StringUnknown(), Name: types.StringValue("analytics"),
+		Options: types.MapUnknown(types.StringType), Location: types.StringUnknown(), Owner: types.StringUnknown(),
+		CreatedAt: types.Int64Unknown(), CreatedBy: types.StringUnknown(), UpdatedAt: types.Int64Unknown(), UpdatedBy: types.StringUnknown(),
+	}).HasError())
+	response := datasource.ReadResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	source.Read(ctx, datasource.ReadRequest{Config: tfsdk.Config{Raw: config.Raw, Schema: schemaResponse.Schema}}, &response)
+
+	require.False(t, response.Diagnostics.HasError(), response.Diagnostics)
+	var data databaseDataSourceModel
+	require.False(t, response.State.Get(ctx, &data).HasError())
+	assert.Equal(t, "analytics", data.Name.ValueString())
+	assert.Equal(t, "analytics", data.ID.ValueString())
+}
+
+func TestTableDataSourceKeepsTheConfiguredIdentity(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			writeProviderJSON(t, w, client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}})
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events":
+			writeProviderJSON(t, w, client.Table{ID: "tbl-1", Database: "secret-token", Name: "secret-token", Schema: client.Schema{Fields: []client.Field{{ID: 0, Name: "id", Type: client.DataType("BIGINT")}}}})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL})
+	require.NoError(t, err)
+	source := &tableDataSource{client: api}
+	var schemaResponse datasource.SchemaResponse
+	source.Schema(ctx, datasource.SchemaRequest{}, &schemaResponse)
+	config := tfsdk.State{Schema: schemaResponse.Schema}
+	require.False(t, config.Set(ctx, &tableDataSourceModel{
+		ID: types.StringUnknown(), ServerID: types.StringUnknown(), Database: types.StringValue("analytics"), Name: types.StringValue("events"),
+		Fields: types.ListUnknown(types.ObjectType{AttrTypes: tableFieldAttrTypes()}), PartitionKeys: types.ListUnknown(types.StringType), PrimaryKeys: types.ListUnknown(types.StringType),
+		Options: types.MapUnknown(types.StringType), Comment: types.StringUnknown(), SchemaID: types.Int64Unknown(), Path: types.StringUnknown(), IsExternal: types.BoolUnknown(),
+		Owner: types.StringUnknown(), CreatedAt: types.Int64Unknown(), CreatedBy: types.StringUnknown(), UpdatedAt: types.Int64Unknown(), UpdatedBy: types.StringUnknown(),
+	}).HasError())
+	response := datasource.ReadResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	source.Read(ctx, datasource.ReadRequest{Config: tfsdk.Config{Raw: config.Raw, Schema: schemaResponse.Schema}}, &response)
+
+	require.False(t, response.Diagnostics.HasError(), response.Diagnostics)
+	var data tableDataSourceModel
+	require.False(t, response.State.Get(ctx, &data).HasError())
+	assert.Equal(t, "analytics", data.Database.ValueString())
+	assert.Equal(t, "events", data.Name.ValueString())
+	assert.Equal(t, tableID("analytics", "events"), data.ID.ValueString())
+}
+
+func TestRowFilterCreateDoesNotBlameThePrincipalWhenOnlyTheLookupIs404(t *testing.T) {
+	// Only the lookup answers 404; the write itself failed with 500.
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/config":
+			require.NoError(t, json.NewEncoder(w).Encode(client.ConfigResponse{Defaults: map[string]string{"prefix": "catalog"}}))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			w.WriteHeader(http.StatusInternalServerError)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"code": 500}))
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/catalog/databases/analytics/tables/events/policies":
+			w.WriteHeader(http.StatusNotFound)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"resourceType": "TABLE", "resourceName": "events", "code": 404}))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	api, err := client.New(client.Config{URI: server.URL, RecoveryTimeout: 250 * time.Millisecond})
+	require.NoError(t, err)
+	managed := &rowFilterResource{client: api}
+	var schemaResponse resource.SchemaResponse
+	managed.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	planModel := rowFilterResourceModel{
+		ID:        types.StringUnknown(),
+		Database:  types.StringValue("analytics"),
+		Table:     types.StringValue("events"),
+		Principal: types.StringValue("role:analyst"),
+		Predicate: types.StringValue(`{"field":"tenant_id"}`),
+	}
+	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
+	require.False(t, plan.Set(ctx, &planModel).HasError())
+	response := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	managed.Create(ctx, resource.CreateRequest{Plan: plan}, &response)
+
+	require.True(t, response.Diagnostics.HasError())
+	detail := response.Diagnostics.Errors()[0].Detail()
+	assert.Contains(t, detail, "HTTP 500")
+	assert.NotContains(t, detail, "HTTP 404 to this write")
+}
+
+func TestExplainNotFoundLeavesOtherFailuresAlone(t *testing.T) {
+	detail := explainNotFound("boom", &client.APIError{StatusCode: http.StatusInternalServerError}, "the principal")
+	assert.Equal(t, "boom", detail)
 }
 
 func TestPermissionCreateReconcilesLostResponse(t *testing.T) {

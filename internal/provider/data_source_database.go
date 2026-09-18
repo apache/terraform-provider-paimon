@@ -91,9 +91,9 @@ func (d *databaseDataSource) Read(ctx context.Context, req datasource.ReadReques
 
 		return
 	}
-	data.ID = types.StringValue(database.Name)
+	// Identity comes from the caller, never from the response.
+	data.ID = types.StringValue(data.Name.ValueString())
 	data.ServerID = types.StringValue(database.ID)
-	data.Name = types.StringValue(database.Name)
 	data.Options = stringMapValue(ctx, database.Options, &resp.Diagnostics)
 	data.Location = types.StringValue(database.Location)
 	data.Owner = types.StringValue(database.Owner)

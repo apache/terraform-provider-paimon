@@ -218,7 +218,7 @@ func (r *permissionResource) Create(ctx context.Context, req resource.CreateRequ
 	if err := r.client.GrantPermission(ctx, assignment); err != nil {
 		observed, recovered, recoveryErr := r.reconcileFailedGrant(ctx, plan, assignment, err)
 		if !recovered {
-			resp.Diagnostics.AddError("Unable to grant Paimon permission", recoveryErr.Error())
+			resp.Diagnostics.AddError("Unable to grant Paimon permission", explainNotFound(recoveryErr.Error(), err, permissionReferences))
 
 			return
 		}
@@ -281,7 +281,7 @@ func (r *permissionResource) Update(ctx context.Context, req resource.UpdateRequ
 	if err := r.client.GrantPermission(ctx, assignment); err != nil {
 		observed, recovered, recoveryErr := r.reconcileFailedGrant(ctx, plan, assignment, err)
 		if !recovered {
-			resp.Diagnostics.AddError("Unable to update Paimon permission", recoveryErr.Error())
+			resp.Diagnostics.AddError("Unable to update Paimon permission", explainNotFound(recoveryErr.Error(), err, permissionReferences))
 
 			return
 		}
