@@ -48,7 +48,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          directory="apache-paimon-terraform-${VERSION}"
+          directory="paimon-terraform-${VERSION}"
           archive="apache-paimon-terraform-${VERSION}-src.tgz"
           git archive --format=tar.gz --prefix="${directory}/" -o "${archive}" HEAD
           sha512sum "${archive}" > "${archive}.sha512"

@@ -16,7 +16,7 @@ terraform-plugins/
 build/
 lib/
 dist/
-apache-paimon-terraform-*.tar.gz
+apache-paimon-terraform-*-src.tgz*
 
 # Editors and operating systems
 .idea/
