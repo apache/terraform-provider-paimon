@@ -313,6 +313,8 @@ func (r *rowFilterResource) ImportState(ctx context.Context, req resource.Import
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("database"), model.Database)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("table"), model.Table)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("principal"), model.Principal)...)
+	// The server does not store this flag; import its default.
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("allow_non_atomic_update"), false)...)
 }
 
 func (r *rowFilterResource) readIntoState(ctx context.Context, model *rowFilterResourceModel, diags *diag.Diagnostics) bool {
@@ -333,7 +335,7 @@ func (r *rowFilterResource) readIntoState(ctx context.Context, model *rowFilterR
 		return false
 	}
 	if model.Predicate.IsNull() || model.Predicate.IsUnknown() || !equal {
-		model.Predicate = types.StringValue(remote)
+		model.Predicate = types.StringValue(compactJSON(remote))
 	}
 	model.ID = types.StringValue(rowFilterID(*model))
 
@@ -505,6 +507,7 @@ func (r *columnMaskResource) ImportState(ctx context.Context, req resource.Impor
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("table"), model.Table)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("principal"), model.Principal)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("column"), model.Column)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("allow_non_atomic_update"), false)...)
 }
 
 func (r *columnMaskResource) readIntoState(ctx context.Context, model *columnMaskResourceModel, diags *diag.Diagnostics) bool {
@@ -525,7 +528,7 @@ func (r *columnMaskResource) readIntoState(ctx context.Context, model *columnMas
 		return false
 	}
 	if model.Transform.IsNull() || model.Transform.IsUnknown() || !equal {
-		model.Transform = types.StringValue(remote)
+		model.Transform = types.StringValue(compactJSON(remote))
 	}
 	model.ID = types.StringValue(columnMaskID(*model))
 
