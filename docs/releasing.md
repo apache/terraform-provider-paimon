@@ -114,7 +114,8 @@ From a clean checkout of the branch being released:
 The script:
 
 1. Fast-forwards the branch from the Apache remote, refuses an existing tag,
-   runs the release checks, then creates and pushes `v0.1.0-rc1`.
+   runs the release checks, then creates a GPG-signed `v0.1.0-rc1` tag and
+   pushes it.
 2. Waits for the [release workflow](../.github/workflows/tf-release.yml), which
    builds the source archive with its SHA-512 checksum, builds the Registry
    zip files, `SHA256SUMS`, and manifest with GoReleaser, and publishes them as
@@ -127,20 +128,24 @@ The script:
 Set `RELEASE_PULL=0`, `RELEASE_PUSH_TAG=0`, `RELEASE_SIGN=0`, or
 `RELEASE_UPLOAD=0` (or `RELEASE_DEFAULT=0`) to skip a stage, for example to
 re-sign an existing candidate without re-tagging. Set `GPG_LOCAL_USER` to
-choose the signing key.
+choose the key for the tag and artifact signatures.
 
 ## Vote
 
-Add a short summary of notable changes to the printed email and send it to
+Add a short summary of notable changes to the printed
+`[VOTE] Release Apache Paimon Terraform 0.1.0 (RC1)` email and send it to
 `dev@paimon.apache.org`. The vote stays open for at least 72 hours and passes
 with at least three binding `+1` votes and more binding `+1` than `-1` votes.
 
 If the candidate has problems, fix them on the release branch and cut the next
-candidate with `./dev/release/release_rc.sh <version> <next-rc>`. Delete the
-failed candidate from `dist/dev`.
+candidate with `./dev/release/release_rc.sh <version> <next-rc>`. Never
+overwrite an existing candidate. After its vote is closed, delete the failed
+candidate from `dist/dev`.
 
-When the vote passes, close it with a `[RESULT][VOTE]` reply that lists the
-binding and non-binding votes.
+After 72 hours, reply to the vote thread with
+`[RESULT][VOTE] Release Apache Paimon Terraform 0.1.0 (RC1)`. State whether the
+vote passed, list binding and non-binding votes separately, and link the
+archived vote thread.
 
 ## Final release
 
@@ -154,7 +159,7 @@ The script:
 
 1. Confirms the RC prerelease carries `SHA256SUMS`, a valid `SHA256SUMS.sig`,
    and the manifest that the registries require.
-2. Tags `v0.1.0` at the exact RC commit and pushes it.
+2. Creates a GPG-signed `v0.1.0` tag at the exact RC commit and pushes it.
 3. Moves the voted source release from `dist/dev` to `dist/release`.
 4. Creates the final GitHub Release from the voted source and binaries. Nothing
    is rebuilt. Because the binaries are promoted, `go version -m` reports the RC
@@ -181,11 +186,17 @@ The script:
    check; do not substitute a local binary when recording distribution
    evidence. Retain the output and the release signing-key identity with the
    release verification.
-3. Send the printed `[ANNOUNCE]` email to `dev@paimon.apache.org` from your
-   `@apache.org` address.
-4. Remove superseded releases listed by `release.sh` from `dist/release`; they
+3. Wait at least 24 hours after publishing, following the Paimon project
+   convention, and confirm the source release is on
+   `downloads.apache.org/paimon/`. Then send the printed `[ANNOUNCE]` email as
+   plain text from your `@apache.org` address to `dev@paimon.apache.org` and
+   `announce@apache.org`.
+4. Open a PR against [`apache/paimon-website`](https://github.com/apache/paimon-website)
+   that adds the release to the download page and release notes. Merge it only
+   after the 24-hour wait.
+5. Remove superseded releases listed by `release.sh` from `dist/release`; they
    remain available from `archive.apache.org`.
-5. Review the generated GitHub release notes and confirm the release is marked
+6. Review the generated GitHub release notes and confirm the release is marked
    as the latest release.
 
 ## Verifying a release candidate

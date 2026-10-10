@@ -17,14 +17,15 @@
 # Finalizes a release after the vote passes. It promotes the exact artifacts
 # that were voted on; nothing is rebuilt:
 #
-#   1. Tags v<version> at the RC commit and pushes it.
+#   1. Creates a signed v<version> tag at the RC commit and pushes it.
 #   2. Moves the source release from dist/dev to dist/release.
 #   3. Creates the final GitHub Release with the promoted source release and the
 #      signed convenience binaries from the RC prerelease. The Terraform and
 #      OpenTofu registries ingest this release.
 #
 # <rc> is the release candidate that passed the vote. RELEASE_REMOTE names the
-# git remote for apache/terraform-provider-paimon (default: origin).
+# git remote for apache/terraform-provider-paimon (default: origin), and
+# GPG_LOCAL_USER selects the tag signing key when several are available.
 
 set -euo pipefail
 
@@ -42,6 +43,11 @@ binary_sums="terraform-provider-paimon_${version}_SHA256SUMS"
 dist_dev="https://dist.apache.org/repos/dist/dev/paimon"
 dist_release="https://dist.apache.org/repos/dist/release/paimon"
 : "${RELEASE_REMOTE:=origin}"
+
+tag_args=(-s)
+if [[ -n "${GPG_LOCAL_USER:-}" ]]; then
+  tag_args=(-u "${GPG_LOCAL_USER}")
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
@@ -75,7 +81,8 @@ for required in "${binary_sums}" "${binary_sums}.sig" "terraform-provider-paimon
 done
 gpg --verify "${work_dir}/assets/${binary_sums}.sig" "${work_dir}/assets/${binary_sums}"
 
-git tag -a "${tag}" "${rc_commit}" -m "Apache Paimon Terraform provider ${version}"
+git tag "${tag_args[@]}" "${tag}" "${rc_commit}" -m "Apache Paimon Terraform ${version}"
+git tag -v "${tag}"
 git push "${RELEASE_REMOTE}" "${tag}"
 
 svn mv "${dist_dev}/${release_id}-rc${rc}" "${dist_release}/${release_id}" \
@@ -106,13 +113,15 @@ fi
 
 cat <<MAIL
 
-After both registries list ${version}, run dev/release/verify_registry.sh and send:
+Wait at least 24 hours after publishing and until both registries list
+${version} (check with dev/release/verify_registry.sh). Then send this as plain
+text from your @apache.org address:
 
-To: dev@paimon.apache.org
-Subject: [ANNOUNCE] Apache Paimon Terraform provider ${version} released
+To: dev@paimon.apache.org, announce@apache.org
+Subject: [ANNOUNCE] Release Apache Paimon Terraform ${version}
 
-The Apache Paimon community is pleased to announce the release of the Apache
-Paimon Terraform provider ${version}.
+The Apache Paimon community is pleased to announce the release of Apache
+Paimon Terraform ${version}.
 
 The provider manages Apache Paimon REST Catalog databases, tables, and access
 policies with Terraform and OpenTofu.

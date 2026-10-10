@@ -16,9 +16,9 @@
 
 # Cuts a release candidate for the Apache Paimon Terraform provider:
 #
-#   1. Runs the release checks, then tags v<version>-rc<rc> and pushes it, which
-#      triggers the "Terraform Build Release Candidate" workflow
-#      (.github/workflows/tf-release.yml). CI builds the source archive and the
+#   1. Runs the release checks, then creates a signed v<version>-rc<rc> tag and
+#      pushes it, which triggers the "Terraform Build Release Candidate"
+#      workflow (.github/workflows/tf-release.yml). CI builds the source archive and the
 #      convenience binaries and publishes them as a GitHub prerelease.
 #   2. Waits for that workflow, then signs the source archive (.asc) and the
 #      binary SHA256SUMS (.sig) with your KEYS-registered GPG key and uploads the
@@ -54,8 +54,10 @@ staging_name="paimon-terraform-${version}-rc${rc}"
 : "${RELEASE_REMOTE:=origin}"
 
 gpg_args=()
+tag_args=(-s)
 if [[ -n "${GPG_LOCAL_USER:-}" ]]; then
   gpg_args=(--local-user "${GPG_LOCAL_USER}")
+  tag_args=(-u "${GPG_LOCAL_USER}")
 fi
 
 sha512_check() {
@@ -103,7 +105,8 @@ trap 'rm -rf "${work_dir}"' EXIT
 staging="${work_dir}/stage"
 
 if [[ ${RELEASE_PUSH_TAG} -gt 0 ]]; then
-  git tag -a "${tag}" -m "Apache Paimon Terraform provider ${version} RC${rc}"
+  git tag "${tag_args[@]}" "${tag}" -m "Apache Paimon Terraform ${version} RC${rc}"
+  git tag -v "${tag}"
   git push "${RELEASE_REMOTE}" "${tag}"
 fi
 rc_hash="$(git rev-list --max-count=1 "${tag}")"
@@ -142,12 +145,12 @@ fi
 
 cat <<MAIL
 To: dev@paimon.apache.org
-Subject: [VOTE][Terraform] Release Apache Paimon Terraform provider v${version} RC${rc}
+Subject: [VOTE] Release Apache Paimon Terraform ${version} (RC${rc})
 
 Hi everyone,
 
-Please review and vote on release candidate ${rc} of the Apache Paimon
-Terraform provider v${version}.
+Please review and vote on release candidate ${rc} of Apache Paimon
+Terraform ${version}, the Terraform and OpenTofu provider for Apache Paimon.
 
 The candidate is based on commit ${rc_hash} [1].
 
@@ -164,9 +167,9 @@ See [5] for how to verify the release candidate:
 
 The vote will be open for at least 72 hours.
 
-[ ] +1 Release this as Apache Paimon Terraform provider v${version}
+[ ] +1 Release this as Apache Paimon Terraform ${version}
 [ ] +0
-[ ] -1 Do not release this as Apache Paimon Terraform provider v${version} because...
+[ ] -1 Do not release this as Apache Paimon Terraform ${version} because...
 
 [1] https://github.com/${repository}/tree/${rc_hash}
 [2] https://dist.apache.org/repos/dist/dev/paimon/${staging_name}/

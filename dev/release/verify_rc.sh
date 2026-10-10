@@ -38,7 +38,7 @@ version="$1"
 rc="$2"
 rc_id="paimon-terraform-${version}-rc${rc}"
 source_archive="apache-paimon-terraform-${version}-src.tgz"
-source_directory="apache-paimon-terraform-${version}"
+source_directory="paimon-terraform-${version}"
 repository="apache/terraform-provider-paimon"
 binary_sums="terraform-provider-paimon_${version}_SHA256SUMS"
 
