@@ -67,15 +67,20 @@ sha512_check() {
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
 
-remote_url="$(git remote get-url "${RELEASE_REMOTE}")"
-case "${remote_url}" in
-  "git@github.com:${repository}.git" | "https://github.com/${repository}" | "https://github.com/${repository}.git") ;;
-  *)
-    echo "remote ${RELEASE_REMOTE} points at ${remote_url}, not ${repository}" >&2
-    echo "set RELEASE_REMOTE to the remote for the Apache repository" >&2
-    exit 1
-    ;;
-esac
+# Check every fetch and push URL, since a remote can push somewhere other than
+# where it fetches from. URLs are never printed: they may embed credentials.
+remote_urls="$(git remote get-url --all "${RELEASE_REMOTE}")"
+remote_urls+=$'\n'"$(git remote get-url --push --all "${RELEASE_REMOTE}")"
+while IFS= read -r remote_url; do
+  case "${remote_url}" in
+    "git@github.com:${repository}.git" | "https://github.com/${repository}" | "https://github.com/${repository}.git") ;;
+    *)
+      echo "remote ${RELEASE_REMOTE} has a fetch or push URL that is not ${repository}" >&2
+      echo "set RELEASE_REMOTE to a remote whose URLs all point at the Apache repository" >&2
+      exit 1
+      ;;
+  esac
+done <<<"${remote_urls}"
 
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "release candidates must be cut from a clean checkout" >&2
