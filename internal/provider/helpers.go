@@ -123,6 +123,22 @@ func equivalentJSON(left, right string) bool {
 	return reflect.DeepEqual(leftValue, rightValue)
 }
 
+// compactJSON formats JSON like jsonencode, avoiding whitespace-only diffs.
+func compactJSON(value string) string {
+	var decoded any
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.UseNumber()
+	if decoder.Decode(&decoded) != nil || !json.Valid([]byte(value)) {
+		return value
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		return value
+	}
+
+	return string(encoded)
+}
+
 func mutationRecoveryContext(ctx context.Context, api *client.Client) (context.Context, context.CancelFunc) {
 	// A canceled apply context can still follow a mutation that committed remotely.
 	// Keep request-scoped values, but give reconciliation and repair a fresh bound.

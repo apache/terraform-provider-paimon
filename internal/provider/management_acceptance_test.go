@@ -16,6 +16,7 @@
 package provider
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -197,4 +198,79 @@ func TestAccManagementResourceLifecycle(t *testing.T) {
 	defer catalog.mu.Unlock()
 	require.Empty(t, catalog.policies)
 	require.Empty(t, catalog.permissions)
+}
+
+func TestAccPolicyImportPlansNoChanges(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("set TF_ACC=1 to run Terraform acceptance tests")
+	}
+	// Some servers return indented policy JSON.
+	indent := func(value string) string {
+		var out bytes.Buffer
+		require.NoError(t, json.Indent(&out, []byte(value), "", "  "))
+
+		return out.String()
+	}
+	catalog := &managementAcceptanceCatalog{policies: make(map[string]client.DataPolicy), canonicalize: func(p client.PolicyRequest) client.PolicyRequest {
+		if p.RowFilter != nil {
+			p.RowFilter = &client.RowFilter{Predicate: indent(p.RowFilter.Predicate)}
+		}
+		if p.ColumnMask != nil {
+			p.ColumnMask = &client.ColumnMask{OnColumn: p.ColumnMask.OnColumn, Transform: indent(p.ColumnMask.Transform)}
+		}
+
+		return p
+	}}
+	server := httptest.NewServer(catalog)
+	defer server.Close()
+	config := fmt.Sprintf("provider \"paimon\" { uri = %q }\n", server.URL) + managementTableConfig("analytics") + `
+resource "paimon_row_filter" "region" {
+  database = paimon_table.events.database
+  table = paimon_table.events.name
+  principal = "role:analyst"
+  predicate = jsonencode({
+    kind = "LEAF"
+    transform = { name = "FIELD_REF", fieldRef = { index = 1, name = "tenant", type = "STRING" } }
+    function = "EQUAL"
+    literals = ["APAC"]
+  })
+}
+resource "paimon_column_mask" "secret" {
+  database = paimon_table.events.database
+  table = paimon_table.events.name
+  principal = "role:analyst"
+  column = "secret"
+  transform = jsonencode({ name = "NULL" })
+}
+`
+	// Forget the policies without dropping them.
+	forget := fmt.Sprintf("provider \"paimon\" { uri = %q }\n", server.URL) + managementTableConfig("analytics") + `
+removed {
+  from = paimon_row_filter.region
+  lifecycle { destroy = false }
+}
+removed {
+  from = paimon_column_mask.secret
+  lifecycle { destroy = false }
+}
+`
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: config},
+			{Config: forget},
+			{
+				Config: config, ResourceName: "paimon_row_filter.region", ImportState: true, ImportStatePersist: true,
+				ImportStateId: "database=analytics&table=events&principal=role%3Aanalyst",
+			},
+			{
+				Config: config, ResourceName: "paimon_column_mask.secret", ImportState: true, ImportStatePersist: true,
+				ImportStateId: "database=analytics&table=events&principal=role%3Aanalyst&column=secret",
+			},
+			{Config: config, PlanOnly: true},
+		},
+	})
+	catalog.mu.Lock()
+	defer catalog.mu.Unlock()
+	require.Empty(t, catalog.policies)
 }

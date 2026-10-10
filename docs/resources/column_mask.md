@@ -105,6 +105,11 @@ terraform import paimon_column_mask.analyst_email \
   'database=analytics&table=events&principal=role%3Aanalyst&column=email'
 ```
 
+Import records `allow_non_atomic_update` as its default `false` and stores the
+server's `transform` in `jsonencode` form (sorted keys, no whitespace), so
+adopting a policy whose configuration omits the flag plans no changes. When the
+configuration sets the flag to `true`, the next apply only records it in state.
+
 The provider compares known Java policy AST semantics across create, refresh,
 and update: field references resolve by name against the current table schema,
 and one-child AND/OR predicates simplify to their child. Equivalent configured

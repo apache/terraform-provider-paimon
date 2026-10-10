@@ -62,3 +62,17 @@ func TestRetryLookupUntilReturnsLastStaleStateAtDeadline(t *testing.T) {
 	assert.False(t, converged)
 	assert.Equal(t, "stale", value)
 }
+
+func TestCompactJSONMatchesJSONEncode(t *testing.T) {
+	for name, tc := range map[string]struct{ in, want string }{
+		"whitespace":    {"{\n  \"name\": \"NULL\"\n}", `{"name":"NULL"}`},
+		"key order":     {`{"name":"CONCAT","inputs":["***"]}`, `{"inputs":["***"],"name":"CONCAT"}`},
+		"large integer": {`{"literals":[9007199254740993]}`, `{"literals":[9007199254740993]}`},
+		"html escaping": {`{"literals":["a<b&c>d"]}`, `{"literals":["a\u003cb\u0026c\u003ed"]}`},
+		"invalid":       {`{"name":`, `{"name":`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, compactJSON(tc.in))
+		})
+	}
+}
