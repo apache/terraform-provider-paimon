@@ -14,6 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Finalizes a release after the vote passes. It promotes the exact artifacts
+# that were voted on; nothing is rebuilt:
+#
+#   1. Tags v<version> at the RC commit and pushes it.
+#   2. Moves the source release from dist/dev to dist/release.
+#   3. Creates the final GitHub Release with the promoted source release and the
+#      signed convenience binaries from the RC prerelease. The Terraform and
+#      OpenTofu registries ingest this release.
+#
+# <rc> is the release candidate that passed the vote. RELEASE_REMOTE names the
+# git remote for apache/terraform-provider-paimon (default: origin).
+
 set -euo pipefail
 
 if [[ $# -ne 2 || ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
@@ -26,28 +38,89 @@ tag="v${version}"
 rc_tag="${tag}-rc${rc}"
 repository="apache/terraform-provider-paimon"
 release_id="paimon-terraform-${version}"
+binary_sums="terraform-provider-paimon_${version}_SHA256SUMS"
 dist_dev="https://dist.apache.org/repos/dist/dev/paimon"
 dist_release="https://dist.apache.org/repos/dist/release/paimon"
+: "${RELEASE_REMOTE:=origin}"
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${repo_root}"
+
+remote_url="$(git remote get-url "${RELEASE_REMOTE}")"
+case "${remote_url}" in
+  "git@github.com:${repository}.git" | "https://github.com/${repository}" | "https://github.com/${repository}.git") ;;
+  *)
+    echo "remote ${RELEASE_REMOTE} points at ${remote_url}, not ${repository}" >&2
+    echo "set RELEASE_REMOTE to the remote for the Apache repository" >&2
+    exit 1
+    ;;
+esac
 
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "final releases must be published from a clean checkout" >&2
   exit 1
 fi
+git fetch "${RELEASE_REMOTE}" "refs/tags/${rc_tag}:refs/tags/${rc_tag}"
 rc_commit="$(git rev-parse "${rc_tag}^{commit}")"
+
+work_dir="$(mktemp -d -t paimon-provider-release.XXXXXX)"
+trap 'rm -rf "${work_dir}"' EXIT
+
+# The registries reject a release without the signed checksums, so check the
+# voted assets before anything public changes.
+gh release download "${rc_tag}" --repo "${repository}" --dir "${work_dir}/assets" \
+  --pattern 'terraform-provider-paimon_*'
+for required in "${binary_sums}" "${binary_sums}.sig" "terraform-provider-paimon_${version}_manifest.json"; do
+  [[ -f "${work_dir}/assets/${required}" ]] || { echo "RC prerelease is missing ${required}" >&2; exit 1; }
+done
+gpg --verify "${work_dir}/assets/${binary_sums}.sig" "${work_dir}/assets/${binary_sums}"
+
 git tag -a "${tag}" "${rc_commit}" -m "Apache Paimon Terraform provider ${version}"
-git push origin "${tag}"
+git push "${RELEASE_REMOTE}" "${tag}"
 
 svn mv "${dist_dev}/${release_id}-rc${rc}" "${dist_release}/${release_id}" \
   -m "Apache Paimon Terraform provider ${version}"
 
-work_dir="$(mktemp -d -t paimon-provider-release.XXXXXX)"
-trap 'rm -rf "${work_dir}"' EXIT
 svn export "${dist_release}/${release_id}" "${work_dir}/source"
-gh release download "${rc_tag}" --repo "${repository}" --dir "${work_dir}/assets" \
-  --pattern 'terraform-provider-paimon_*'
 cp "${work_dir}/source/"* "${work_dir}/assets/"
 gh release create "${tag}" --repo "${repository}" --title "Apache Paimon Terraform provider ${version}" \
   --generate-notes --verify-tag "${work_dir}/assets/"*
 
-echo "Published ${tag}: https://github.com/${repository}/releases/tag/${tag}"
-echo "Remember to record the release at https://reporter.apache.org/addrelease.html?paimon"
+echo "Published ${tag}:"
+echo "  ${dist_release}/${release_id}"
+echo "  https://github.com/${repository}/releases/tag/${tag}"
+echo
+echo "Record the release at https://reporter.apache.org/addrelease.html?paimon"
+
+# ASF policy keeps only current releases in dist/release; older ones remain on
+# archive.apache.org. Only Terraform provider directories are listed here.
+superseded="$(svn ls "${dist_release}" | sed 's|/$||' | grep -E '^paimon-terraform-[0-9]' |
+  grep -vx "${release_id}" || true)"
+if [[ -n "${superseded}" ]]; then
+  echo
+  echo "Superseded Terraform provider releases still in dist/release:"
+  for old in ${superseded}; do
+    echo "  svn delete -m 'Remove superseded release ${old}' ${dist_release}/${old}"
+  done
+fi
+
+cat <<MAIL
+
+After both registries list ${version}, run dev/release/verify_registry.sh and send:
+
+To: dev@paimon.apache.org
+Subject: [ANNOUNCE] Apache Paimon Terraform provider ${version} released
+
+The Apache Paimon community is pleased to announce the release of the Apache
+Paimon Terraform provider ${version}.
+
+The provider manages Apache Paimon REST Catalog databases, tables, and access
+policies with Terraform and OpenTofu.
+
+Source release: https://downloads.apache.org/paimon/${release_id}/
+Release notes:  https://github.com/${repository}/releases/tag/${tag}
+Terraform:      https://registry.terraform.io/providers/apache/paimon/${version}
+OpenTofu:       https://search.opentofu.org/provider/apache/paimon/v${version}
+
+Thanks to everyone who contributed to this release.
+MAIL
