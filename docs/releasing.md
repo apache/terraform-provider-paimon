@@ -165,7 +165,7 @@ The script:
    is rebuilt. Because the binaries are promoted, `go version -m` reports the RC
    tag they were built from; file names and Registry metadata carry the final
    version, and those are what Terraform and OpenTofu resolve.
-5. Lists any superseded `paimon-terraform-*` directories in `dist/release` and
+5. Lists older patch releases of the same release line in `dist/release` and
    prints the announcement email.
 
 ## Post release
@@ -194,8 +194,10 @@ The script:
 4. Open a PR against [`apache/paimon-website`](https://github.com/apache/paimon-website)
    that adds the release to the download page and release notes. Merge it only
    after the 24-hour wait.
-5. Remove superseded releases listed by `release.sh` from `dist/release`; they
-   remain available from `archive.apache.org`.
+5. Remove the older releases of the same line listed by `release.sh` from
+   `dist/release`; they remain available from `archive.apache.org`. Keep the
+   latest release of every other maintained line. Remove a line's last release
+   only after the community agrees that line is no longer maintained.
 6. Review the generated GitHub release notes and confirm the release is marked
    as the latest release.
 

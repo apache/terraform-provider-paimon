@@ -104,14 +104,22 @@ echo "  https://github.com/${repository}/releases/tag/${tag}"
 echo
 echo "Record the release at https://reporter.apache.org/addrelease.html?paimon"
 
-# ASF policy keeps only current releases in dist/release; older ones remain on
-# archive.apache.org. Only Terraform provider directories are listed here.
-superseded="$(svn ls "${dist_release}" | sed 's|/$||' | grep -E '^paimon-terraform-[0-9]' |
-  grep -vx "${release_id}" || true)"
-if [[ -n "${superseded}" ]]; then
+# ASF policy keeps the latest release of every maintained line in dist/release;
+# older ones remain on archive.apache.org. Only older patch releases of this
+# release line are superseded. Retiring another line is a separate decision.
+release_line="${version%.*}"
+superseded=()
+while IFS= read -r old; do
+  old_version="${old#paimon-terraform-}"
+  if [[ "${old_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "${old_version%.*}" == "${release_line}" &&
+    ${old_version##*.} -lt ${version##*.} ]]; then
+    superseded+=("${old}")
+  fi
+done < <(svn ls "${dist_release}" | sed 's|/$||')
+if [[ ${#superseded[@]} -gt 0 ]]; then
   echo
-  echo "Superseded Terraform provider releases still in dist/release:"
-  for old in ${superseded}; do
+  echo "Older ${release_line}.x releases superseded by ${version} in dist/release:"
+  for old in "${superseded[@]}"; do
     echo "  svn delete -m 'Remove superseded release ${old}' ${dist_release}/${old}"
   done
 fi
