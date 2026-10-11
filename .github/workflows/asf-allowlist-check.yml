@@ -34,4 +34,4 @@ jobs:
         with:
           persist-credentials: false
       # ASF infra publishes this action only from main.
-      - uses: apache/infrastructure-actions/allowlist-check@70a0d87acc3b1103c9377ed325b82b482e08b56f # zizmor: ignore[ref-version-mismatch] main
+      - uses: apache/infrastructure-actions/allowlist-check@aa1000ca529c756c50b6d15e7772fd76e3016074 # zizmor: ignore[ref-version-mismatch] main
