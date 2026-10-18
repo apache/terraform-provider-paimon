@@ -53,7 +53,7 @@ jobs:
           git archive --format=tar.gz --prefix="${directory}/" -o "${archive}" HEAD
           sha512sum "${archive}" > "${archive}.sha512"
       - name: Upload source artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: source-release-candidate
           path: apache-paimon-terraform-*-src.tgz*
@@ -95,7 +95,7 @@ jobs:
           cp terraform-registry-manifest.json \
             "dist/terraform-provider-paimon_${VERSION}_manifest.json"
       - name: Upload binary artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binary-release-candidate
           path: |
